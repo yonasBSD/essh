@@ -106,6 +106,8 @@ pub struct SessionConfig {
     pub reconnect_max_retries: u32,
     pub multiplex: bool,
     pub recording: bool,
+    pub max_concurrent: usize,
+    pub scrollback_lines: usize,
 }
 
 impl Default for SessionConfig {
@@ -115,6 +117,8 @@ impl Default for SessionConfig {
             reconnect_max_retries: 5,
             multiplex: true,
             recording: false,
+            max_concurrent: 9,
+            scrollback_lines: 10000,
         }
     }
 }
@@ -163,6 +167,28 @@ impl Default for AuditConfig {
         Self {
             enabled: true,
             syslog_target: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HostMonitorConfig {
+    pub enabled: bool,
+    pub cpu_interval: u64,
+    pub memory_interval: u64,
+    pub process_count: usize,
+    pub history_samples: usize,
+}
+
+impl Default for HostMonitorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            cpu_interval: 1,
+            memory_interval: 2,
+            process_count: 10,
+            history_samples: 60,
         }
     }
 }
@@ -217,6 +243,8 @@ pub struct AppConfig {
     pub security: SecurityConfig,
     pub audit: AuditConfig,
     #[serde(default)]
+    pub host_monitor: HostMonitorConfig,
+    #[serde(default)]
     pub hosts: Vec<HostEntry>,
     #[serde(default)]
     pub host_groups: Vec<HostGroup>,
@@ -230,6 +258,7 @@ impl Default for AppConfig {
             session: SessionConfig::default(),
             security: SecurityConfig::default(),
             audit: AuditConfig::default(),
+            host_monitor: HostMonitorConfig::default(),
             hosts: Vec::new(),
             host_groups: Vec::new(),
         }
@@ -422,6 +451,18 @@ mod tests {
         let cfg: AppConfig = toml::from_str(toml_str).expect("parse host without port");
         assert_eq!(cfg.hosts.len(), 1);
         assert_eq!(cfg.hosts[0].port, 22);
+    }
+
+    #[test]
+    fn test_host_monitor_config_defaults() {
+        let cfg = AppConfig::default();
+        assert!(cfg.host_monitor.enabled);
+        assert_eq!(cfg.host_monitor.cpu_interval, 1);
+        assert_eq!(cfg.host_monitor.memory_interval, 2);
+        assert_eq!(cfg.host_monitor.process_count, 10);
+        assert_eq!(cfg.host_monitor.history_samples, 60);
+        assert_eq!(cfg.session.max_concurrent, 9);
+        assert_eq!(cfg.session.scrollback_lines, 10000);
     }
 
     #[test]

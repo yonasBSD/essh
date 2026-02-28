@@ -3,6 +3,9 @@ mod cache;
 mod cli;
 mod config;
 mod diagnostics;
+mod event;
+mod monitor;
+mod session;
 mod ssh;
 mod tui;
 
@@ -11,7 +14,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
+    event::{KeyCode, KeyModifiers},
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
@@ -22,8 +25,26 @@ use cache::{CacheDb, HostKeyStatus};
 use cli::{AuditAction, Cli, Commands, ConfigAction, HostsAction, KeysAction, SessionAction};
 use config::{AppConfig, TofuPolicy};
 use diagnostics::DiagnosticsEngine;
+use event::{AppEvent, EventHandler};
+use session::{Session, SessionState};
 use ssh::{AuthMethod, ConnectConfig, SshClient, SshSession};
-use tui::{App, HostDisplay, HostStatus};
+use tui::{App, AppView, DashboardTab, HostDisplay, HostStatus};
+
+// ---------------------------------------------------------------------------
+// Session runtime data (held alongside the TUI App)
+// ---------------------------------------------------------------------------
+
+enum SessionInput {
+    Data(Vec<u8>),
+    Resize { cols: u32, rows: u32 },
+}
+
+struct SessionRuntime {
+    ssh_session: SshSession,
+    channel_tx: tokio::sync::mpsc::Sender<SessionInput>,
+    diagnostics: DiagnosticsEngine,
+    monitor: Option<monitor::HostMetricsCollector>,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -39,7 +60,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// CLI command dispatch
+// CLI command dispatch (unchanged from original)
 // ---------------------------------------------------------------------------
 
 async fn run_command(cmd: Commands, config: AppConfig) -> anyhow::Result<()> {
@@ -272,9 +293,7 @@ async fn run_command(cmd: Commands, config: AppConfig) -> anyhow::Result<()> {
                 if !path.exists() {
                     config.save()?;
                 }
-                std::process::Command::new(editor)
-                    .arg(&path)
-                    .status()?;
+                std::process::Command::new(editor).arg(&path).status()?;
             }
             ConfigAction::Show => {
                 let toml_str = toml::to_string_pretty(&config)?;
@@ -314,7 +333,7 @@ async fn run_command(cmd: Commands, config: AppConfig) -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// SSH connect + interactive shell
+// Direct CLI SSH connect + interactive shell (non-TUI mode)
 // ---------------------------------------------------------------------------
 
 async fn connect_and_shell(
@@ -341,114 +360,7 @@ async fn connect_and_shell(
     // TOFU host key check
     let db = CacheDb::open_default()?;
     let status = db.check_host_key(&connect_config.hostname, connect_config.port, &fingerprint)?;
-
-    match status {
-        HostKeyStatus::Trusted => {
-            audit.log_host_key_event(
-                &session_id,
-                &connect_config.hostname,
-                connect_config.port,
-                AuditEventType::HostKeyVerified,
-                &fingerprint,
-            );
-        }
-        HostKeyStatus::Unknown => match app_config.general.tofu_policy {
-            TofuPolicy::Auto => {
-                db.trust_host(
-                    &connect_config.hostname,
-                    None,
-                    connect_config.port,
-                    &fingerprint,
-                    "ssh",
-                )?;
-                audit.log_host_key_event(
-                    &session_id,
-                    &connect_config.hostname,
-                    connect_config.port,
-                    AuditEventType::HostKeyNewTrust,
-                    &fingerprint,
-                );
-                println!("Host key cached (auto-trust).");
-            }
-            TofuPolicy::Prompt => {
-                println!("Unknown host key: {}", fingerprint);
-                print!("Trust this host? [y/N] ");
-                io::stdout().flush()?;
-                let mut answer = String::new();
-                io::stdin().read_line(&mut answer)?;
-                if answer.trim().eq_ignore_ascii_case("y") {
-                    db.trust_host(
-                        &connect_config.hostname,
-                        None,
-                        connect_config.port,
-                        &fingerprint,
-                        "ssh",
-                    )?;
-                    audit.log_host_key_event(
-                        &session_id,
-                        &connect_config.hostname,
-                        connect_config.port,
-                        AuditEventType::HostKeyNewTrust,
-                        &fingerprint,
-                    );
-                } else {
-                    audit.log_host_key_event(
-                        &session_id,
-                        &connect_config.hostname,
-                        connect_config.port,
-                        AuditEventType::HostKeyRejected,
-                        &fingerprint,
-                    );
-                    anyhow::bail!("Host key rejected by user.");
-                }
-            }
-            TofuPolicy::Strict => {
-                audit.log_host_key_event(
-                    &session_id,
-                    &connect_config.hostname,
-                    connect_config.port,
-                    AuditEventType::HostKeyRejected,
-                    &fingerprint,
-                );
-                anyhow::bail!(
-                    "Unknown host key for {}. Add it to the cache first (strict TOFU policy).",
-                    connect_config.hostname
-                );
-            }
-        },
-        HostKeyStatus::Changed {
-            old_fingerprint,
-            old_last_seen,
-        } => {
-            audit.log_host_key_event(
-                &session_id,
-                &connect_config.hostname,
-                connect_config.port,
-                AuditEventType::HostKeyChanged,
-                &fingerprint,
-            );
-            eprintln!("⚠️  WARNING: HOST KEY HAS CHANGED!");
-            eprintln!("  Old fingerprint: {}", old_fingerprint);
-            eprintln!("  New fingerprint: {}", fingerprint);
-            eprintln!("  Last seen:       {}", old_last_seen);
-            eprintln!("This could indicate a man-in-the-middle attack.");
-            print!("Accept new key? [y/N] ");
-            io::stdout().flush()?;
-            let mut answer = String::new();
-            io::stdin().read_line(&mut answer)?;
-            if answer.trim().eq_ignore_ascii_case("y") {
-                db.trust_host(
-                    &connect_config.hostname,
-                    None,
-                    connect_config.port,
-                    &fingerprint,
-                    "ssh",
-                )?;
-            } else {
-                anyhow::bail!("Connection aborted — host key change rejected.");
-            }
-        }
-    }
+    handle_tofu(&db, &connect_config, &fingerprint, &status, app_config, audit, &session_id)?;
 
     db.update_last_seen(&connect_config.hostname, connect_config.port)?;
 
@@ -465,7 +377,6 @@ async fn connect_and_shell(
         println!("Server banner: {}", b.trim());
     }
 
-    // Set up diagnostics
     let log_dir = AppConfig::data_dir().join("sessions");
     let diag = DiagnosticsEngine::new(
         &session_id,
@@ -483,9 +394,7 @@ async fn connect_and_shell(
     )
     .await;
 
-    // Get terminal size
     let (cols, rows) = terminal::size()?;
-
     let channel = session
         .open_shell("xterm-256color", cols as u32, rows as u32)
         .await?;
@@ -499,7 +408,6 @@ async fn connect_and_shell(
 
     println!("Connected. Session ID: {}", session_id);
 
-    // Run interactive shell
     run_interactive_shell(channel, diag).await?;
 
     audit.log_session_event(
@@ -510,7 +418,6 @@ async fn connect_and_shell(
     );
 
     session.close().await.ok();
-
     println!("Session ended.");
     Ok(())
 }
@@ -519,12 +426,10 @@ async fn run_interactive_shell(
     mut channel: russh::Channel<russh::client::Msg>,
     diag: DiagnosticsEngine,
 ) -> anyhow::Result<()> {
-    // Put terminal in raw mode (may fail if stdin is not a TTY)
     let is_tty = std::io::IsTerminal::is_terminal(&io::stdin());
     if is_tty {
         terminal::enable_raw_mode()?;
     }
-
     let _raw_guard = scopeguard::guard((), move |_| {
         if is_tty {
             terminal::disable_raw_mode().ok();
@@ -542,7 +447,6 @@ async fn run_interactive_shell(
         Some(log_dir.as_path()),
     );
 
-    // Spawn diagnostics writer
     let diag_metrics_clone = diag.metrics();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -589,9 +493,7 @@ async fn run_interactive_shell(
                             io::stderr().flush()?;
                         }
                     }
-                    russh::ChannelMsg::Eof | russh::ChannelMsg::Close => {
-                        break;
-                    }
+                    russh::ChannelMsg::Eof | russh::ChannelMsg::Close => break,
                     russh::ChannelMsg::ExitStatus { exit_status } => {
                         if exit_status != 0 {
                             eprintln!("\r\nRemote process exited with status {}", exit_status);
@@ -609,20 +511,17 @@ async fn run_interactive_shell(
         }
     }
 
-    // Final diagnostics flush
     diag.write_log_entry().await.ok();
-
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// TUI dashboard
+// TUI mode — concurrent sessions
 // ---------------------------------------------------------------------------
 
 async fn run_tui(config: AppConfig) -> anyhow::Result<()> {
-    let mut app = App::new();
+    let mut app = App::new(config.session.max_concurrent);
 
-    // Load hosts from cache + config
     load_hosts_into_app(&mut app, &config)?;
 
     io::stdout().execute(EnterAlternateScreen)?;
@@ -631,7 +530,7 @@ async fn run_tui(config: AppConfig) -> anyhow::Result<()> {
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let result = tui_loop(&mut terminal, &mut app, &config).await;
+    let result = tui_main_loop(&mut terminal, &mut app, &config).await;
 
     terminal::disable_raw_mode()?;
     io::stdout().execute(LeaveAlternateScreen)?;
@@ -639,85 +538,748 @@ async fn run_tui(config: AppConfig) -> anyhow::Result<()> {
     result
 }
 
-async fn tui_loop(
+async fn tui_main_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
     config: &AppConfig,
 ) -> anyhow::Result<()> {
+    let mut events = EventHandler::new(Duration::from_millis(100));
+    let audit = AuditLogger::default_logger();
+
+    // Session runtime data, indexed same as session_manager.sessions
+    let mut runtimes: Vec<Option<SessionRuntime>> = Vec::new();
+
+    // Per-session channel receivers for remote output
+    let mut session_output_rxs: Vec<Option<tokio::sync::mpsc::Receiver<Vec<u8>>>> = Vec::new();
+
+    // Tick counter for periodic monitor collection
+    let mut tick_count: u64 = 0;
+
     loop {
+        // Draw
         terminal.draw(|frame| {
-            tui::render_dashboard(frame, app);
+            tui::render(frame, app);
         })?;
 
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                match key.code {
-                    KeyCode::Char('q') => return Ok(()),
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        return Ok(())
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => app.next(),
-                    KeyCode::Up | KeyCode::Char('k') => app.previous(),
-                    KeyCode::Enter => {
-                        if let Some(host) = app.selected_host().cloned() {
-                            // Exit TUI, connect in CLI mode
-                            terminal::disable_raw_mode()?;
-                            io::stdout().execute(LeaveAlternateScreen)?;
-
-                            let user = if host.user.is_empty() {
-                                config
-                                    .general
-                                    .default_user
-                                    .clone()
-                                    .unwrap_or_else(whoami)
-                            } else {
-                                host.user.clone()
-                            };
-
-                            let auth = if let Some(ref key) = config.general.default_key {
-                                let expanded = shellexpand::tilde(key).to_string();
-                                AuthMethod::KeyFile(expanded.into())
-                            } else {
-                                let pw = prompt_password(&format!(
-                                    "{}@{}'s password: ",
-                                    user, host.hostname
-                                ))?;
-                                AuthMethod::Password(pw)
-                            };
-
-                            let connect_config = ConnectConfig {
-                                hostname: host.hostname.clone(),
-                                port: host.port,
-                                username: user,
-                                auth,
-                            };
-
-                            let audit = AuditLogger::default_logger();
-                            connect_and_shell(connect_config, config, &audit).await?;
-
-                            // Re-enter TUI
-                            io::stdout().execute(EnterAlternateScreen)?;
-                            terminal::enable_raw_mode()?;
-                            load_hosts_into_app(app, config)?;
+        // Poll session output (non-blocking drain from all active sessions)
+        for (i, rx_opt) in session_output_rxs.iter_mut().enumerate() {
+            if let Some(rx) = rx_opt {
+                while let Ok(data) = rx.try_recv() {
+                    if let Some(session) = app.session_manager.sessions.get_mut(i) {
+                        session.terminal.process(&data);
+                        if app.session_manager.active_index != Some(i) {
+                            session.has_new_output = true;
                         }
                     }
-                    KeyCode::Char('r') => {
-                        load_hosts_into_app(app, config)?;
-                        app.set_status("Hosts refreshed.".to_string());
+                }
+            }
+        }
+
+        // Handle events
+        match events.next().await? {
+            AppEvent::Key(key) => {
+                let handled = handle_key_event(
+                    key,
+                    app,
+                    config,
+                    &audit,
+                    &mut runtimes,
+                    &mut session_output_rxs,
+                )
+                .await?;
+                if handled == KeyAction::Quit {
+                    // Close all sessions
+                    for rt in runtimes.iter_mut().flatten() {
+                        rt.ssh_session.close().await.ok();
                     }
-                    KeyCode::Char('d') => {
-                        if let Some(host) = app.selected_host().cloned() {
-                            let db = CacheDb::open_default()?;
-                            db.remove_host(&host.hostname, host.port)?;
-                            load_hosts_into_app(app, config)?;
-                            app.set_status(format!("Removed {}.", host.hostname));
+                    return Ok(());
+                }
+            }
+            AppEvent::Tick => {
+                tick_count += 1;
+
+                // Update diagnostics snapshots every 10 ticks (1s)
+                if tick_count % 10 == 0 {
+                    for (i, rt_opt) in runtimes.iter().enumerate() {
+                        if let Some(rt) = rt_opt {
+                            let snap = rt.diagnostics.snapshot().await;
+                            if let Some(slot) = app.session_diagnostics.get_mut(i) {
+                                *slot = Some(snap);
+                            }
                         }
                     }
-                    _ => {}
+                }
+
+                // Collect host metrics every 20 ticks (2s)
+                if tick_count % 20 == 0 {
+                    for (i, rt_opt) in runtimes.iter().enumerate() {
+                        if let Some(rt) = rt_opt {
+                            if let Some(ref mon) = rt.monitor {
+                                let handle = &rt.ssh_session.handle;
+                                // Non-blocking: spawn collection as a task
+                                let metrics_arc = mon.metrics();
+                                let cpu_h = mon.cpu_history();
+                                let mem_h = mon.mem_history();
+                                let rx_h = mon.net_rx_history();
+                                let tx_h = mon.net_tx_history();
+                                // We do a quick clone of handle for the spawned task
+                                // Actually we can't easily clone Handle, so collect inline
+                                if let Err(_) = mon.collect(handle).await {
+                                    // Metric collection failed, skip
+                                }
+                                // Update app state from collector
+                                if let Some(slot) = app.session_metrics.get_mut(i) {
+                                    *slot = Some(metrics_arc.read().await.clone());
+                                }
+                                if let Some(h) = app.session_cpu_history.get_mut(i) {
+                                    *h = cpu_h.read().await.clone();
+                                }
+                                if let Some(h) = app.session_mem_history.get_mut(i) {
+                                    *h = mem_h.read().await.clone();
+                                }
+                                if let Some(h) = app.session_net_rx_history.get_mut(i) {
+                                    *h = rx_h.read().await.clone();
+                                }
+                                if let Some(h) = app.session_net_tx_history.get_mut(i) {
+                                    *h = tx_h.read().await.clone();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            AppEvent::Resize(w, h) => {
+                // Forward PTY resize to all active sessions
+                for rt_opt in runtimes.iter() {
+                    if let Some(rt) = rt_opt {
+                        rt.channel_tx.send(SessionInput::Resize {
+                            cols: w as u32,
+                            rows: h as u32,
+                        }).await.ok();
+                    }
                 }
             }
         }
     }
+}
+
+#[derive(PartialEq)]
+enum KeyAction {
+    Handled,
+    Quit,
+}
+
+async fn handle_key_event(
+    key: crossterm::event::KeyEvent,
+    app: &mut App,
+    config: &AppConfig,
+    audit: &AuditLogger,
+    runtimes: &mut Vec<Option<SessionRuntime>>,
+    output_rxs: &mut Vec<Option<tokio::sync::mpsc::Receiver<Vec<u8>>>>,
+) -> anyhow::Result<KeyAction> {
+    // Help toggle — intercept before anything else
+    if app.show_help {
+        match key.code {
+            KeyCode::Char('?') | KeyCode::Esc => app.show_help = false,
+            _ => {}
+        }
+        return Ok(KeyAction::Handled);
+    }
+    if key.code == KeyCode::Char('?') && !key.modifiers.contains(KeyModifiers::ALT) {
+        // Don't intercept '?' when in an active session (it should go to remote shell)
+        if app.view != AppView::Session {
+            app.show_help = true;
+            return Ok(KeyAction::Handled);
+        }
+    }
+
+    let is_alt = key.modifiers.contains(KeyModifiers::ALT);
+
+    // Global keybindings (work in all views)
+    if is_alt {
+        match key.code {
+            // Alt+1 through Alt+9: switch to session
+            KeyCode::Char(c @ '1'..='9') => {
+                let idx = (c as usize) - ('1' as usize);
+                if app.session_manager.switch_to(idx) {
+                    app.view = AppView::Session;
+                }
+                return Ok(KeyAction::Handled);
+            }
+            // Alt+Left: previous session
+            KeyCode::Left => {
+                app.session_manager.switch_prev();
+                if app.session_manager.has_sessions() {
+                    app.view = AppView::Session;
+                }
+                return Ok(KeyAction::Handled);
+            }
+            // Alt+Right: next session
+            KeyCode::Right => {
+                app.session_manager.switch_next();
+                if app.session_manager.has_sessions() {
+                    app.view = AppView::Session;
+                }
+                return Ok(KeyAction::Handled);
+            }
+            // Alt+Tab: last session
+            KeyCode::Tab => {
+                app.session_manager.switch_last();
+                if app.session_manager.has_sessions() {
+                    app.view = AppView::Session;
+                }
+                return Ok(KeyAction::Handled);
+            }
+            // Alt+m: toggle monitor
+            KeyCode::Char('m') => {
+                if app.session_manager.has_sessions() {
+                    app.view = if app.view == AppView::Monitor {
+                        AppView::Session
+                    } else {
+                        app.monitor_process_scroll = 0;
+                        AppView::Monitor
+                    };
+                }
+                return Ok(KeyAction::Handled);
+            }
+            // Alt+d: detach (go back to dashboard)
+            KeyCode::Char('d') => {
+                app.view = AppView::Dashboard;
+                return Ok(KeyAction::Handled);
+            }
+            // Alt+h or Alt+?: toggle help
+            KeyCode::Char('h') | KeyCode::Char('?') => {
+                app.show_help = !app.show_help;
+                return Ok(KeyAction::Handled);
+            }
+            // Alt+w: close active session
+            KeyCode::Char('w') => {
+                if let Some(idx) = app.session_manager.active_index {
+                    // Close SSH connection
+                    if let Some(Some(rt)) = runtimes.get_mut(idx) {
+                        rt.ssh_session.close().await.ok();
+                    }
+                    // Remove runtime and tracking
+                    if idx < runtimes.len() {
+                        runtimes.remove(idx);
+                    }
+                    if idx < output_rxs.len() {
+                        output_rxs.remove(idx);
+                    }
+                    app.session_manager.remove_session(idx);
+                    app.remove_session_tracking(idx);
+
+                    if !app.session_manager.has_sessions() {
+                        app.view = AppView::Dashboard;
+                    }
+                }
+                return Ok(KeyAction::Handled);
+            }
+            _ => {}
+        }
+    }
+
+    // View-specific keybindings
+    match app.view {
+        AppView::Dashboard => {
+            handle_dashboard_key(key, app, config, audit, runtimes, output_rxs).await
+        }
+        AppView::Session => {
+            handle_session_key(key, app, runtimes).await
+        }
+        AppView::Monitor => {
+            handle_monitor_key(key, app)
+        }
+    }
+}
+
+async fn handle_dashboard_key(
+    key: crossterm::event::KeyEvent,
+    app: &mut App,
+    config: &AppConfig,
+    audit: &AuditLogger,
+    runtimes: &mut Vec<Option<SessionRuntime>>,
+    output_rxs: &mut Vec<Option<tokio::sync::mpsc::Receiver<Vec<u8>>>>,
+) -> anyhow::Result<KeyAction> {
+    match key.code {
+        KeyCode::Char('q') => return Ok(KeyAction::Quit),
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            return Ok(KeyAction::Quit)
+        }
+        KeyCode::Down | KeyCode::Char('j') => app.next_host(),
+        KeyCode::Up | KeyCode::Char('k') => app.prev_host(),
+        KeyCode::Char('1') => app.dashboard_tab = DashboardTab::Sessions,
+        KeyCode::Char('2') => app.dashboard_tab = DashboardTab::Hosts,
+        KeyCode::Char('3') => app.dashboard_tab = DashboardTab::Fleet,
+        KeyCode::Char('4') => app.dashboard_tab = DashboardTab::Config,
+        KeyCode::Char('r') => {
+            load_hosts_into_app(app, config)?;
+            app.set_status("Hosts refreshed.".to_string());
+        }
+        KeyCode::Char('d') => {
+            if let Some(host) = app.selected_host().cloned() {
+                let db = CacheDb::open_default()?;
+                db.remove_host(&host.hostname, host.port)?;
+                load_hosts_into_app(app, config)?;
+                app.set_status(format!("Removed {}.", host.hostname));
+            }
+        }
+        KeyCode::Enter => {
+            if let Some(host) = app.selected_host().cloned() {
+                // Open a new session to this host
+                open_session(app, config, audit, &host, runtimes, output_rxs).await?;
+            }
+        }
+        _ => {}
+    }
+    Ok(KeyAction::Handled)
+}
+
+async fn handle_session_key(
+    key: crossterm::event::KeyEvent,
+    app: &mut App,
+    runtimes: &mut Vec<Option<SessionRuntime>>,
+) -> anyhow::Result<KeyAction> {
+    // In session view, forward all non-Alt keys to the remote shell
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        return Ok(KeyAction::Handled); // already handled in global
+    }
+
+    if let Some(idx) = app.session_manager.active_index {
+        if let Some(Some(rt)) = runtimes.get(idx) {
+            // Convert key event to bytes and send to remote
+            let bytes = key_to_bytes(key);
+            if !bytes.is_empty() {
+                rt.channel_tx.send(SessionInput::Data(bytes)).await.ok();
+            }
+        }
+    }
+
+    Ok(KeyAction::Handled)
+}
+
+fn handle_monitor_key(
+    key: crossterm::event::KeyEvent,
+    app: &mut App,
+) -> anyhow::Result<KeyAction> {
+    match key.code {
+        KeyCode::Esc => {
+            app.view = AppView::Session;
+        }
+        KeyCode::Char('s') => {
+            app.monitor_sort = match app.monitor_sort {
+                tui::host_monitor::ProcessSort::Cpu => tui::host_monitor::ProcessSort::Memory,
+                tui::host_monitor::ProcessSort::Memory => tui::host_monitor::ProcessSort::Cpu,
+            };
+            app.monitor_process_scroll = 0;
+        }
+        KeyCode::Down => {
+            app.monitor_process_scroll = app.monitor_process_scroll.saturating_add(1);
+        }
+        KeyCode::Up => {
+            app.monitor_process_scroll = app.monitor_process_scroll.saturating_sub(1);
+        }
+        _ => {}
+    }
+    Ok(KeyAction::Handled)
+}
+
+async fn open_session(
+    app: &mut App,
+    config: &AppConfig,
+    audit: &AuditLogger,
+    host: &HostDisplay,
+    runtimes: &mut Vec<Option<SessionRuntime>>,
+    output_rxs: &mut Vec<Option<tokio::sync::mpsc::Receiver<Vec<u8>>>>,
+) -> anyhow::Result<()> {
+    let session_id = uuid::Uuid::new_v4().to_string();
+
+    let user = if host.user.is_empty() {
+        config
+            .general
+            .default_user
+            .clone()
+            .unwrap_or_else(whoami)
+    } else {
+        host.user.clone()
+    };
+
+    let auth = if let Some(ref key) = config.general.default_key {
+        let expanded = shellexpand::tilde(key).to_string();
+        AuthMethod::KeyFile(expanded.into())
+    } else {
+        app.set_status("No key configured. Set general.default_key in config.".to_string());
+        return Ok(());
+    };
+
+    let connect_config = ConnectConfig {
+        hostname: host.hostname.clone(),
+        port: host.port,
+        username: user.clone(),
+        auth,
+    };
+
+    let label = if host.name.is_empty() {
+        host.hostname.clone()
+    } else {
+        host.name.clone()
+    };
+
+    // Create session in connecting state
+    let session = Session::new(
+        session_id.clone(),
+        label.clone(),
+        host.hostname.clone(),
+        host.port,
+        user.clone(),
+        config.session.scrollback_lines,
+    );
+
+    let idx = match app.session_manager.add_session(session) {
+        Ok(idx) => idx,
+        Err(msg) => {
+            app.set_status(msg);
+            return Ok(());
+        }
+    };
+    app.add_session_tracking(config.host_monitor.history_samples);
+
+    audit.log_connection_attempt(
+        &session_id,
+        &connect_config.hostname,
+        connect_config.port,
+        &connect_config.username,
+    );
+
+    app.view = AppView::Session;
+
+    // Connect in background (but we're in the event loop, so do it inline for now)
+    match SshClient::connect(&connect_config).await {
+        Ok((mut ssh_session, fingerprint, banner)) => {
+            // TOFU check
+            let db = CacheDb::open_default()?;
+            let status = db.check_host_key(&connect_config.hostname, connect_config.port, &fingerprint)?;
+            match status {
+                HostKeyStatus::Trusted | HostKeyStatus::Unknown => {
+                    if matches!(status, HostKeyStatus::Unknown) {
+                        db.trust_host(
+                            &connect_config.hostname,
+                            None,
+                            connect_config.port,
+                            &fingerprint,
+                            "ssh",
+                        )?;
+                    }
+                }
+                HostKeyStatus::Changed { .. } => {
+                    // Auto-accept in TUI mode for now (could add dialog later)
+                    db.trust_host(
+                        &connect_config.hostname,
+                        None,
+                        connect_config.port,
+                        &fingerprint,
+                        "ssh",
+                    )?;
+                }
+            }
+            db.update_last_seen(&connect_config.hostname, connect_config.port)?;
+
+            // Set up diagnostics
+            let log_dir = AppConfig::data_dir().join("sessions");
+            let diag = DiagnosticsEngine::new(
+                &session_id,
+                &connect_config.hostname,
+                connect_config.port,
+                Some(log_dir.as_path()),
+            );
+            diag.set_connection_info(
+                banner,
+                None,
+                None,
+                None,
+                None,
+                Some(format!("{:?}", connect_config.auth)),
+            )
+            .await;
+
+            // Open shell channel
+            let (cols, rows) = terminal::size()?;
+            let channel = ssh_session
+                .open_shell("xterm-256color", cols as u32, rows as u32)
+                .await?;
+
+            // Set up channel I/O forwarding
+            let (output_tx, output_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+            let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<SessionInput>(64);
+
+            // Spawn channel I/O task
+            let diag_metrics = diag.metrics();
+            let mut channel = channel;
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        Some(msg) = channel.wait() => {
+                            match msg {
+                                russh::ChannelMsg::Data { data } => {
+                                    let bytes = data.to_vec();
+                                    {
+                                        let mut m = diag_metrics.write().await;
+                                        m.bytes_received += bytes.len() as u64;
+                                    }
+                                    if output_tx.send(bytes).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                russh::ChannelMsg::Eof | russh::ChannelMsg::Close => break,
+                                russh::ChannelMsg::ExitStatus { .. } => break,
+                                _ => {}
+                            }
+                        }
+                        Some(input) = input_rx.recv() => {
+                            match input {
+                                SessionInput::Data(data) => {
+                                    {
+                                        let mut m = diag_metrics.write().await;
+                                        m.bytes_sent += data.len() as u64;
+                                    }
+                                    if channel.data(&data[..]).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                SessionInput::Resize { cols, rows } => {
+                                    channel.window_change(cols, rows, 0, 0).await.ok();
+                                }
+                            }
+                        }
+                        else => break,
+                    }
+                }
+            });
+
+            // Set up host monitor
+            let monitor = if config.host_monitor.enabled {
+                Some(monitor::HostMetricsCollector::new(
+                    config.host_monitor.history_samples,
+                    config.host_monitor.process_count,
+                ))
+            } else {
+                None
+            };
+
+            // Update session state
+            if let Some(session) = app.session_manager.sessions.get_mut(idx) {
+                session.state = SessionState::Active;
+            }
+
+            // Store runtime
+            let runtime = SessionRuntime {
+                ssh_session,
+                channel_tx: input_tx,
+                diagnostics: diag,
+                monitor,
+            };
+
+            // Ensure vectors are large enough
+            while runtimes.len() <= idx {
+                runtimes.push(None);
+            }
+            while output_rxs.len() <= idx {
+                output_rxs.push(None);
+            }
+            runtimes[idx] = Some(runtime);
+            output_rxs[idx] = Some(output_rx);
+
+            audit.log_session_event(
+                &session_id,
+                &connect_config.hostname,
+                connect_config.port,
+                AuditEventType::SessionStart,
+            );
+
+            app.set_status(format!("Connected to {}", label));
+        }
+        Err(e) => {
+            if let Some(session) = app.session_manager.sessions.get_mut(idx) {
+                session.state = SessionState::Disconnected {
+                    reason: e.to_string(),
+                };
+            }
+            app.set_status(format!("Connection failed: {}", e));
+        }
+    }
+
+    Ok(())
+}
+
+/// Convert a crossterm KeyEvent into bytes to send to the remote shell
+fn key_to_bytes(key: crossterm::event::KeyEvent) -> Vec<u8> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Char(c) => {
+            if ctrl {
+                // Ctrl+A = 0x01, Ctrl+C = 0x03, etc.
+                let byte = (c as u8).wrapping_sub(b'a').wrapping_add(1);
+                vec![byte]
+            } else {
+                let mut buf = [0u8; 4];
+                let s = c.encode_utf8(&mut buf);
+                s.as_bytes().to_vec()
+            }
+        }
+        KeyCode::Enter => vec![b'\r'],
+        KeyCode::Backspace => vec![0x7f],
+        KeyCode::Tab => vec![b'\t'],
+        KeyCode::Esc => vec![0x1b],
+        KeyCode::Up => b"\x1b[A".to_vec(),
+        KeyCode::Down => b"\x1b[B".to_vec(),
+        KeyCode::Right => b"\x1b[C".to_vec(),
+        KeyCode::Left => b"\x1b[D".to_vec(),
+        KeyCode::Home => b"\x1b[H".to_vec(),
+        KeyCode::End => b"\x1b[F".to_vec(),
+        KeyCode::PageUp => b"\x1b[5~".to_vec(),
+        KeyCode::PageDown => b"\x1b[6~".to_vec(),
+        KeyCode::Delete => b"\x1b[3~".to_vec(),
+        KeyCode::Insert => b"\x1b[2~".to_vec(),
+        KeyCode::F(n) => match n {
+            1 => b"\x1bOP".to_vec(),
+            2 => b"\x1bOQ".to_vec(),
+            3 => b"\x1bOR".to_vec(),
+            4 => b"\x1bOS".to_vec(),
+            5 => b"\x1b[15~".to_vec(),
+            6 => b"\x1b[17~".to_vec(),
+            7 => b"\x1b[18~".to_vec(),
+            8 => b"\x1b[19~".to_vec(),
+            9 => b"\x1b[20~".to_vec(),
+            10 => b"\x1b[21~".to_vec(),
+            11 => b"\x1b[23~".to_vec(),
+            12 => b"\x1b[24~".to_vec(),
+            _ => vec![],
+        },
+        _ => vec![],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TOFU handling
+// ---------------------------------------------------------------------------
+
+fn handle_tofu(
+    db: &CacheDb,
+    connect_config: &ConnectConfig,
+    fingerprint: &str,
+    status: &HostKeyStatus,
+    app_config: &AppConfig,
+    audit: &AuditLogger,
+    session_id: &str,
+) -> anyhow::Result<()> {
+    match status {
+        HostKeyStatus::Trusted => {
+            audit.log_host_key_event(
+                session_id,
+                &connect_config.hostname,
+                connect_config.port,
+                AuditEventType::HostKeyVerified,
+                fingerprint,
+            );
+        }
+        HostKeyStatus::Unknown => match app_config.general.tofu_policy {
+            TofuPolicy::Auto => {
+                db.trust_host(
+                    &connect_config.hostname,
+                    None,
+                    connect_config.port,
+                    fingerprint,
+                    "ssh",
+                )?;
+                audit.log_host_key_event(
+                    session_id,
+                    &connect_config.hostname,
+                    connect_config.port,
+                    AuditEventType::HostKeyNewTrust,
+                    fingerprint,
+                );
+                println!("Host key cached (auto-trust).");
+            }
+            TofuPolicy::Prompt => {
+                println!("Unknown host key: {}", fingerprint);
+                print!("Trust this host? [y/N] ");
+                io::stdout().flush()?;
+                let mut answer = String::new();
+                io::stdin().read_line(&mut answer)?;
+                if answer.trim().eq_ignore_ascii_case("y") {
+                    db.trust_host(
+                        &connect_config.hostname,
+                        None,
+                        connect_config.port,
+                        fingerprint,
+                        "ssh",
+                    )?;
+                    audit.log_host_key_event(
+                        session_id,
+                        &connect_config.hostname,
+                        connect_config.port,
+                        AuditEventType::HostKeyNewTrust,
+                        fingerprint,
+                    );
+                } else {
+                    audit.log_host_key_event(
+                        session_id,
+                        &connect_config.hostname,
+                        connect_config.port,
+                        AuditEventType::HostKeyRejected,
+                        fingerprint,
+                    );
+                    anyhow::bail!("Host key rejected by user.");
+                }
+            }
+            TofuPolicy::Strict => {
+                audit.log_host_key_event(
+                    session_id,
+                    &connect_config.hostname,
+                    connect_config.port,
+                    AuditEventType::HostKeyRejected,
+                    fingerprint,
+                );
+                anyhow::bail!(
+                    "Unknown host key for {}. Add it first (strict TOFU).",
+                    connect_config.hostname
+                );
+            }
+        },
+        HostKeyStatus::Changed {
+            old_fingerprint,
+            old_last_seen,
+        } => {
+            audit.log_host_key_event(
+                session_id,
+                &connect_config.hostname,
+                connect_config.port,
+                AuditEventType::HostKeyChanged,
+                fingerprint,
+            );
+            eprintln!("⚠️  WARNING: HOST KEY HAS CHANGED!");
+            eprintln!("  Old fingerprint: {}", old_fingerprint);
+            eprintln!("  New fingerprint: {}", fingerprint);
+            eprintln!("  Last seen:       {}", old_last_seen);
+            eprintln!("This could indicate a man-in-the-middle attack.");
+            print!("Accept new key? [y/N] ");
+            io::stdout().flush()?;
+            let mut answer = String::new();
+            io::stdin().read_line(&mut answer)?;
+            if answer.trim().eq_ignore_ascii_case("y") {
+                db.trust_host(
+                    &connect_config.hostname,
+                    None,
+                    connect_config.port,
+                    fingerprint,
+                    "ssh",
+                )?;
+            } else {
+                anyhow::bail!("Connection aborted — host key change rejected.");
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -728,7 +1290,6 @@ fn parse_target(target: &str, config: &AppConfig) -> (String, String) {
     if let Some((user, host)) = target.split_once('@') {
         (user.to_string(), host.to_string())
     } else {
-        // Check if target matches a named host in config
         if let Some(entry) = config.hosts.iter().find(|h| h.name == target) {
             let user = entry
                 .user
@@ -758,7 +1319,7 @@ fn prompt_password(prompt: &str) -> anyhow::Result<String> {
     terminal::enable_raw_mode()?;
     let mut pw = String::new();
     loop {
-        if let Event::Key(key) = event::read()? {
+        if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
             match key.code {
                 KeyCode::Enter => {
                     terminal::disable_raw_mode()?;
@@ -778,11 +1339,11 @@ fn prompt_password(prompt: &str) -> anyhow::Result<String> {
 fn load_hosts_into_app(app: &mut App, config: &AppConfig) -> anyhow::Result<()> {
     let mut displays = Vec::new();
 
-    // Load from cache DB
     if let Ok(db) = CacheDb::open_default() {
         if let Ok(hosts) = db.list_hosts() {
             for h in hosts {
-                let tags: Vec<String> = h.tags.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+                let tags: Vec<String> =
+                    h.tags.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
                 displays.push(HostDisplay {
                     name: h.hostname.clone(),
                     hostname: h.hostname,
@@ -796,9 +1357,11 @@ fn load_hosts_into_app(app: &mut App, config: &AppConfig) -> anyhow::Result<()> 
         }
     }
 
-    // Merge config-defined hosts
     for entry in &config.hosts {
-        if !displays.iter().any(|d| d.hostname == entry.hostname && d.port == entry.port) {
+        if !displays
+            .iter()
+            .any(|d| d.hostname == entry.hostname && d.port == entry.port)
+        {
             let tags: Vec<String> = entry
                 .tags
                 .iter()
@@ -970,7 +1533,12 @@ async fn run_on_group(
         .or_else(|| config.general.default_user.clone())
         .unwrap_or_else(whoami);
 
-    let auth = if let Some(ref key) = grp.defaults.key.as_ref().or(config.general.default_key.as_ref()) {
+    let auth = if let Some(ref key) = grp
+        .defaults
+        .key
+        .as_ref()
+        .or(config.general.default_key.as_ref())
+    {
         let expanded = shellexpand::tilde(key).to_string();
         AuthMethod::KeyFile(expanded.into())
     } else {

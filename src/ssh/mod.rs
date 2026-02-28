@@ -201,7 +201,7 @@ impl SshSession {
         Ok(channel)
     }
 
-    pub async fn close(self) -> Result<(), SshError> {
+    pub async fn close(&self) -> Result<(), SshError> {
         self.handle
             .disconnect(Disconnect::ByApplication, "goodbye", "en")
             .await

@@ -1,10 +1,18 @@
+pub mod dashboard;
+pub mod help;
+pub mod host_monitor;
+pub mod session_view;
+pub mod widgets;
+
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Cell, Paragraph, Row, Table, TableState},
+    layout::{Constraint, Direction, Layout},
+    widgets::TableState,
 };
+
+use crate::session::manager::SessionManager;
+use crate::monitor::{HostMetrics, history::MetricHistory};
+use crate::diagnostics::DiagnosticsSnapshot;
 
 #[derive(Clone, Debug)]
 pub struct HostDisplay {
@@ -24,49 +32,61 @@ pub enum HostStatus {
     Unknown,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum AppMode {
-    Dashboard,
-    Connecting,
-    Connected,
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DashboardTab {
+    Sessions,
+    Hosts,
+    Fleet,
+    Config,
 }
 
-#[derive(Clone, Debug)]
-pub struct DiagnosticsView {
-    pub session_id: String,
-    pub hostname: String,
-    pub rtt_ms: Option<f64>,
-    pub bytes_sent: u64,
-    pub bytes_received: u64,
-    pub throughput_up: f64,
-    pub throughput_down: f64,
-    pub packet_loss_pct: f64,
-    pub quality: String,
-    pub uptime: String,
-    pub cipher: String,
-    pub auth_method: String,
-    pub channels: u32,
-    pub server_banner: String,
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AppView {
+    Dashboard,
+    Session,
+    Monitor,
 }
 
 pub struct App {
     pub hosts: Vec<HostDisplay>,
     pub selected_host: usize,
-    pub mode: AppMode,
-    pub diagnostics: Option<DiagnosticsView>,
-    pub status_message: Option<String>,
     pub table_state: TableState,
+    pub session_manager: SessionManager,
+    pub view: AppView,
+    pub dashboard_tab: DashboardTab,
+    pub status_message: Option<String>,
+    pub monitor_sort: host_monitor::ProcessSort,
+    pub monitor_process_scroll: usize,
+    pub show_help: bool,
+    // Per-session diagnostics snapshots (indexed by session manager index)
+    pub session_diagnostics: Vec<Option<DiagnosticsSnapshot>>,
+    // Per-session host metrics (indexed by session manager index)
+    pub session_metrics: Vec<Option<HostMetrics>>,
+    pub session_cpu_history: Vec<MetricHistory>,
+    pub session_mem_history: Vec<MetricHistory>,
+    pub session_net_rx_history: Vec<MetricHistory>,
+    pub session_net_tx_history: Vec<MetricHistory>,
 }
 
 impl App {
-    pub fn new() -> Self {
+    pub fn new(max_sessions: usize) -> Self {
         Self {
             hosts: Vec::new(),
             selected_host: 0,
-            mode: AppMode::Dashboard,
-            diagnostics: None,
-            status_message: None,
             table_state: TableState::default(),
+            session_manager: SessionManager::new(max_sessions),
+            view: AppView::Dashboard,
+            dashboard_tab: DashboardTab::Hosts,
+            status_message: None,
+            monitor_sort: host_monitor::ProcessSort::Cpu,
+            monitor_process_scroll: 0,
+            show_help: false,
+            session_diagnostics: Vec::new(),
+            session_metrics: Vec::new(),
+            session_cpu_history: Vec::new(),
+            session_mem_history: Vec::new(),
+            session_net_rx_history: Vec::new(),
+            session_net_tx_history: Vec::new(),
         }
     }
 
@@ -86,7 +106,7 @@ impl App {
         self.hosts.get(self.selected_host)
     }
 
-    pub fn next(&mut self) {
+    pub fn next_host(&mut self) {
         if self.hosts.is_empty() {
             return;
         }
@@ -94,7 +114,7 @@ impl App {
         self.table_state.select(Some(self.selected_host));
     }
 
-    pub fn previous(&mut self) {
+    pub fn prev_host(&mut self) {
         if self.hosts.is_empty() {
             return;
         }
@@ -110,143 +130,129 @@ impl App {
         self.status_message = Some(msg);
     }
 
-    pub fn set_diagnostics(&mut self, diag: DiagnosticsView) {
-        self.diagnostics = Some(diag);
+    pub fn add_session_tracking(&mut self, history_samples: usize) {
+        self.session_diagnostics.push(None);
+        self.session_metrics.push(None);
+        self.session_cpu_history.push(MetricHistory::new(history_samples));
+        self.session_mem_history.push(MetricHistory::new(history_samples));
+        self.session_net_rx_history.push(MetricHistory::new(history_samples));
+        self.session_net_tx_history.push(MetricHistory::new(history_samples));
     }
 
-    pub fn clear_diagnostics(&mut self) {
-        self.diagnostics = None;
+    pub fn remove_session_tracking(&mut self, index: usize) {
+        if index < self.session_diagnostics.len() {
+            self.session_diagnostics.remove(index);
+            self.session_metrics.remove(index);
+            self.session_cpu_history.remove(index);
+            self.session_mem_history.remove(index);
+            self.session_net_rx_history.remove(index);
+            self.session_net_tx_history.remove(index);
+        }
     }
 }
 
-pub fn render_dashboard(frame: &mut Frame, app: &mut App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(0),
-            Constraint::Length(3),
-        ])
-        .split(frame.area());
+pub fn render(frame: &mut Frame, app: &mut App) {
+    match app.view {
+        AppView::Dashboard => {
+            dashboard::render(
+                frame,
+                frame.area(),
+                &app.session_manager.sessions,
+                &app.hosts,
+                app.selected_host,
+                &mut app.table_state,
+                app.dashboard_tab,
+                app.status_message.as_deref(),
+            );
+        }
+        AppView::Session => {
+            if let Some(active_idx) = app.session_manager.active_index {
+                let area = frame.area();
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(3),  // tab bar
+                        Constraint::Min(4),    // terminal
+                        Constraint::Length(2), // status bar
+                        Constraint::Length(2), // footer
+                    ])
+                    .split(area);
 
-    // Title bar
-    let title = Paragraph::new("⚡ ESSH — Enterprise SSH Client")
-        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
-    frame.render_widget(title, chunks[0]);
+                session_view::render_tab_bar(
+                    frame,
+                    chunks[0],
+                    &app.session_manager.sessions,
+                    active_idx,
+                );
 
-    // Host table
-    let header = Row::new(["Name", "Hostname", "Port", "User", "Status", "Last Seen", "Tags"])
-        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
-        .bottom_margin(1);
+                // Resize virtual terminal to match the render area
+                let term_area = chunks[1];
+                if let Some(session) = app.session_manager.sessions.get_mut(active_idx) {
+                    session.terminal.resize(term_area.height, term_area.width);
+                }
 
-    let rows: Vec<Row> = app
-        .hosts
-        .iter()
-        .map(|h| {
-            let status_cell = match h.status {
-                HostStatus::Online => Cell::from("● Online").style(Style::default().fg(Color::Green)),
-                HostStatus::Offline => Cell::from("● Offline").style(Style::default().fg(Color::Red)),
-                HostStatus::Unknown => Cell::from("● Unknown").style(Style::default().fg(Color::DarkGray)),
-            };
-            Row::new([
-                Cell::from(h.name.clone()),
-                Cell::from(h.hostname.clone()),
-                Cell::from(h.port.to_string()),
-                Cell::from(h.user.clone()),
-                status_cell,
-                Cell::from(h.last_seen.clone()),
-                Cell::from(h.tags.clone()),
-            ])
-        })
-        .collect();
+                if let Some(session) = app.session_manager.sessions.get(active_idx) {
+                    session_view::render_terminal(frame, chunks[1], session);
+                    let diag = app.session_diagnostics.get(active_idx).and_then(|d| d.as_ref());
+                    session_view::render_status_bar(frame, chunks[2], session, diag);
+                }
 
-    let widths = [
-        Constraint::Percentage(15),
-        Constraint::Percentage(20),
-        Constraint::Percentage(7),
-        Constraint::Percentage(10),
-        Constraint::Percentage(12),
-        Constraint::Percentage(18),
-        Constraint::Percentage(18),
-    ];
+                session_view::render_footer(frame, chunks[3]);
+            }
+        }
+        AppView::Monitor => {
+            if let Some(active_idx) = app.session_manager.active_index {
+                let area = frame.area();
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(3),  // tab bar
+                        Constraint::Min(10),   // monitor
+                    ])
+                    .split(area);
 
-    let table = Table::new(rows, widths)
-        .header(header)
-        .block(Block::bordered().title("Hosts"))
-        .row_highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol(">> ");
+                session_view::render_tab_bar(
+                    frame,
+                    chunks[0],
+                    &app.session_manager.sessions,
+                    active_idx,
+                );
 
-    frame.render_stateful_widget(table, chunks[1], &mut app.table_state);
+                let metrics = app.session_metrics.get(active_idx)
+                    .and_then(|m| m.as_ref())
+                    .cloned()
+                    .unwrap_or_default();
 
-    // Status bar
-    let mut status_lines = vec![Line::from(vec![
-        Span::styled("[Enter]", Style::default().fg(Color::Cyan)),
-        Span::raw(" Connect  "),
-        Span::styled("[a]", Style::default().fg(Color::Cyan)),
-        Span::raw(" Add Host  "),
-        Span::styled("[d]", Style::default().fg(Color::Cyan)),
-        Span::raw(" Delete  "),
-        Span::styled("[r]", Style::default().fg(Color::Cyan)),
-        Span::raw(" Refresh  "),
-        Span::styled("[q]", Style::default().fg(Color::Cyan)),
-        Span::raw(" Quit"),
-    ])];
+                let cpu_hist = app.session_cpu_history.get(active_idx)
+                    .cloned()
+                    .unwrap_or_else(|| MetricHistory::new(60));
+                let mem_hist = app.session_mem_history.get(active_idx)
+                    .cloned()
+                    .unwrap_or_else(|| MetricHistory::new(60));
+                let rx_hist = app.session_net_rx_history.get(active_idx)
+                    .cloned()
+                    .unwrap_or_else(|| MetricHistory::new(60));
+                let tx_hist = app.session_net_tx_history.get(active_idx)
+                    .cloned()
+                    .unwrap_or_else(|| MetricHistory::new(60));
 
-    if let Some(ref msg) = app.status_message {
-        status_lines.push(Line::from(Span::styled(
-            msg.clone(),
-            Style::default().fg(Color::Yellow),
-        )));
+                host_monitor::render(
+                    frame,
+                    chunks[1],
+                    &metrics,
+                    &cpu_hist,
+                    &mem_hist,
+                    &rx_hist,
+                    &tx_hist,
+                    &app.monitor_sort,
+                    app.monitor_process_scroll,
+                );
+            }
+        }
     }
 
-    let status_bar = Paragraph::new(status_lines)
-        .block(Block::bordered().title("Status"));
-    frame.render_widget(status_bar, chunks[2]);
-}
-
-pub fn render_status_bar(frame: &mut Frame, area: Rect, diag: &DiagnosticsView) {
-    let rtt_text = match diag.rtt_ms {
-        Some(rtt) => format!("{:.1}ms", rtt),
-        None => "N/A".to_string(),
-    };
-
-    let quality_color = match diag.quality.as_str() {
-        "Excellent" | "Good" => Color::Green,
-        "Fair" => Color::Yellow,
-        _ => Color::Red,
-    };
-
-    let line = Line::from(vec![
-        Span::styled("RTT: ", Style::default().fg(Color::DarkGray)),
-        Span::raw(&rtt_text),
-        Span::raw("  "),
-        Span::styled("↑ ", Style::default().fg(Color::Green)),
-        Span::raw(format!("{:.1} KB/s", diag.throughput_up / 1024.0)),
-        Span::raw("  "),
-        Span::styled("↓ ", Style::default().fg(Color::Cyan)),
-        Span::raw(format!("{:.1} KB/s", diag.throughput_down / 1024.0)),
-        Span::raw("  "),
-        Span::styled("Loss: ", Style::default().fg(Color::DarkGray)),
-        Span::raw(format!("{:.1}%", diag.packet_loss_pct)),
-        Span::raw("  "),
-        Span::styled("Quality: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(&diag.quality, Style::default().fg(quality_color)),
-        Span::raw("  "),
-        Span::styled("Up: ", Style::default().fg(Color::DarkGray)),
-        Span::raw(&diag.uptime),
-        Span::raw("  "),
-        Span::styled("Cipher: ", Style::default().fg(Color::DarkGray)),
-        Span::raw(&diag.cipher),
-        Span::raw("  "),
-        Span::styled("Ch: ", Style::default().fg(Color::DarkGray)),
-        Span::raw(format!("{}", diag.channels)),
-    ]);
-
-    let block = Block::bordered().title(diag.hostname.as_str());
-    let paragraph = Paragraph::new(line).block(block);
-    frame.render_widget(paragraph, area);
+    // Help overlay (rendered on top of any view)
+    if app.show_help {
+        help::render(frame);
+    }
 }

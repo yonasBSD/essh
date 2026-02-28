@@ -2,6 +2,15 @@
 name = "essh"
 version = "0.1.0"
 edition = "2021"
+description = "Enterprise SSH client with concurrent sessions, real-time host diagnostics, and a Netwatch-inspired TUI"
+license = "MIT"
+repository = "https://github.com/matthart1983/essh"
+homepage = "https://github.com/matthart1983/essh"
+readme = "README.md"
+keywords = ["ssh", "tui", "terminal", "devops", "monitoring"]
+categories = ["command-line-utilities", "network-programming"]
+authors = ["Matt Hartley <matthew.t.hartley@gmail.com>"]
+exclude = ["target/", ".git/"]
 
 [[bin]]
 name = "essh"
@@ -45,3 +54,4 @@ async-trait = "0.1"
 anyhow = "1"
 shellexpand = "3"
 scopeguard = "1"
+vt100 = "0.16"

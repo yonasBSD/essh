@@ -112,6 +112,9 @@ impl CacheDb {
             Ok((stored_fp, last_seen)) => {
                 if stored_fp == fingerprint {
                     Ok(HostKeyStatus::Trusted)
+                } else if stored_fp == "unknown" || stored_fp == "imported" {
+                    // Host was added manually or imported without a real fingerprint
+                    Ok(HostKeyStatus::Unknown)
                 } else {
                     Ok(HostKeyStatus::Changed {
                         old_fingerprint: stored_fp,
