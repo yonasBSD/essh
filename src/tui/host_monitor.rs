@@ -23,18 +23,26 @@ pub fn render(
     sort: &ProcessSort,
     process_scroll: usize,
 ) {
+    // Outer border around everything
+    let outer_block = Block::bordered()
+        .title(" Host Monitor ")
+        .title_style(Style::default().fg(Color::Cyan).bold())
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = outer_block.inner(area);
+    f.render_widget(outer_block, area);
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(6),  // CPU
-            Constraint::Length(5),  // Memory
-            Constraint::Length(3),  // Load + Uptime
-            Constraint::Length(5),  // Disk
-            Constraint::Length(3),  // Net I/O
-            Constraint::Min(6),    // Processes
-            Constraint::Length(2), // Footer
+            Constraint::Length(6),   // CPU
+            Constraint::Length(5),   // Memory
+            Constraint::Length(3),   // Load + Uptime
+            Constraint::Length(12),  // Disk (header + up to 10 mounts + border)
+            Constraint::Length(3),   // Net I/O
+            Constraint::Min(6),     // Processes
+            Constraint::Length(2),   // Footer
         ])
-        .split(area);
+        .split(inner);
 
     render_cpu(f, chunks[0], metrics, cpu_history);
     render_memory(f, chunks[1], metrics, mem_history);
@@ -159,7 +167,7 @@ fn render_disks(f: &mut Frame, area: Rect, metrics: &HostMetrics) {
     ]);
 
     let mut lines = vec![header];
-    for disk in metrics.disks.iter().take(3) {
+    for disk in metrics.disks.iter().take(10) {
         let avail = disk.total_bytes.saturating_sub(disk.used_bytes);
         let bar = widgets::bar_gauge(disk.use_pct, 10);
         let mount_display: String = if disk.mount.len() > mount_width {
