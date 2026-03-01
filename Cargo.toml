@@ -55,6 +55,7 @@ anyhow = "1"
 shellexpand = "3"
 scopeguard = "1"
 vt100 = "0.16"
+regex = "1"
 
 [dev-dependencies]
 tempfile = "3"

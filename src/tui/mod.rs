@@ -1,6 +1,7 @@
 pub mod dashboard;
 pub mod help;
 pub mod host_monitor;
+pub mod portfwd_view;
 pub mod session_view;
 pub mod widgets;
 
@@ -13,6 +14,13 @@ use ratatui::{
 use crate::session::manager::SessionManager;
 use crate::monitor::{HostMetrics, history::MetricHistory};
 use crate::diagnostics::DiagnosticsSnapshot;
+use crate::portfwd::PortForwardManager;
+
+pub struct Notification {
+    pub session_label: String,
+    pub matched_text: String,
+    pub timestamp: chrono::DateTime<chrono::Local>,
+}
 
 #[derive(Clone, Debug)]
 pub struct HostDisplay {
@@ -48,6 +56,7 @@ pub enum AppView {
     Dashboard,
     Session,
     Monitor,
+    PortForwarding,
 }
 
 pub struct App {
@@ -75,6 +84,12 @@ pub struct App {
     pub session_mem_history: Vec<MetricHistory>,
     pub session_net_rx_history: Vec<MetricHistory>,
     pub session_net_tx_history: Vec<MetricHistory>,
+    // Background activity notifications
+    pub notifications: Vec<Notification>,
+    // Port forwarding
+    pub port_forward_managers: Vec<PortForwardManager>,
+    pub port_forward_input: String,
+    pub port_forward_adding: bool,
 }
 
 impl App {
@@ -100,6 +115,10 @@ impl App {
             session_mem_history: Vec::new(),
             session_net_rx_history: Vec::new(),
             session_net_tx_history: Vec::new(),
+            notifications: Vec::new(),
+            port_forward_managers: Vec::new(),
+            port_forward_input: String::new(),
+            port_forward_adding: false,
         }
     }
 
@@ -188,6 +207,7 @@ impl App {
         self.session_mem_history.push(MetricHistory::new(history_samples));
         self.session_net_rx_history.push(MetricHistory::new(history_samples));
         self.session_net_tx_history.push(MetricHistory::new(history_samples));
+        self.port_forward_managers.push(PortForwardManager::new());
     }
 
     pub fn remove_session_tracking(&mut self, index: usize) {
@@ -198,6 +218,9 @@ impl App {
             self.session_mem_history.remove(index);
             self.session_net_rx_history.remove(index);
             self.session_net_tx_history.remove(index);
+        }
+        if index < self.port_forward_managers.len() {
+            self.port_forward_managers.remove(index);
         }
     }
 }
@@ -238,6 +261,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                     chunks[0],
                     &app.session_manager.sessions,
                     active_idx,
+                    &app.notifications,
                 );
 
                 if app.split_pane {
@@ -302,7 +326,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
                 if let Some(session) = app.session_manager.sessions.get(active_idx) {
                     let diag = app.session_diagnostics.get(active_idx).and_then(|d| d.as_ref());
-                    session_view::render_status_bar(frame, chunks[2], session, diag);
+                    session_view::render_status_bar(frame, chunks[2], session, diag, app.port_forward_managers.get(active_idx));
                 }
 
                 session_view::render_footer(frame, chunks[3]);
@@ -324,6 +348,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                     chunks[0],
                     &app.session_manager.sessions,
                     active_idx,
+                    &app.notifications,
                 );
 
                 let metrics = app.session_metrics.get(active_idx)
@@ -355,6 +380,41 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                     &app.monitor_sort,
                     app.monitor_process_scroll,
                 );
+            }
+        }
+        AppView::PortForwarding => {
+            // Render the session view behind the overlay
+            if let Some(active_idx) = app.session_manager.active_index {
+                let area = frame.area();
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(3),
+                        Constraint::Min(4),
+                        Constraint::Length(2),
+                        Constraint::Length(2),
+                    ])
+                    .split(area);
+
+                session_view::render_tab_bar(
+                    frame,
+                    chunks[0],
+                    &app.session_manager.sessions,
+                    active_idx,
+                    &app.notifications,
+                );
+
+                if let Some(session) = app.session_manager.sessions.get(active_idx) {
+                    session_view::render_terminal(frame, chunks[1], session);
+                    let diag = app.session_diagnostics.get(active_idx).and_then(|d| d.as_ref());
+                    session_view::render_status_bar(frame, chunks[2], session, diag, app.port_forward_managers.get(active_idx));
+                }
+                session_view::render_footer(frame, chunks[3]);
+
+                // Port forward overlay
+                if let Some(mgr) = app.port_forward_managers.get(active_idx) {
+                    portfwd_view::render(frame, mgr, &app.port_forward_input, app.port_forward_adding);
+                }
             }
         }
     }

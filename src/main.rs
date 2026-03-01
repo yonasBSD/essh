@@ -6,6 +6,8 @@ mod diagnostics;
 mod event;
 mod fleet;
 mod monitor;
+mod notify;
+mod portfwd;
 mod recording;
 mod session;
 mod ssh;
@@ -30,7 +32,8 @@ use diagnostics::DiagnosticsEngine;
 use event::{AppEvent, EventHandler};
 use session::{Session, SessionState};
 use ssh::{AuthMethod, ConnectConfig, SshClient, SshSession};
-use tui::{App, AppView, DashboardTab, HostDisplay, HostStatus};
+use notify::NotificationMatcher;
+use tui::{App, AppView, DashboardTab, HostDisplay, HostStatus, Notification};
 
 // ---------------------------------------------------------------------------
 // Session runtime data (held alongside the TUI App)
@@ -625,6 +628,9 @@ async fn tui_main_loop(
     // Per-session reconnect trackers (indexed same as sessions)
     let mut reconnect_trackers: Vec<Option<ReconnectTracker>> = Vec::new();
 
+    // Notification matcher for background session output
+    let notification_matcher = NotificationMatcher::new(&config.session.notification_patterns);
+
     // Fleet health prober
     let mut fleet_prober = fleet::FleetProber::new(
         config.fleet.probe_interval,
@@ -648,6 +654,16 @@ async fn tui_main_loop(
                                 session.terminal.process(&data);
                                 if app.session_manager.active_index != Some(i) {
                                     session.has_new_output = true;
+                                    if !notification_matcher.is_empty() {
+                                        let text = String::from_utf8_lossy(&data);
+                                        if let Some(matched) = notification_matcher.check(&text) {
+                                            app.notifications.push(Notification {
+                                                session_label: session.label.clone(),
+                                                matched_text: matched,
+                                                timestamp: chrono::Local::now(),
+                                            });
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -910,6 +926,10 @@ async fn handle_key_event(
             KeyCode::Char(c @ '1'..='9') => {
                 let idx = (c as usize) - ('1' as usize);
                 if app.session_manager.switch_to(idx) {
+                    if let Some(session) = app.session_manager.sessions.get(idx) {
+                        let label = session.label.clone();
+                        app.notifications.retain(|n| n.session_label != label);
+                    }
                     app.view = AppView::Session;
                 }
                 return Ok(KeyAction::Handled);
@@ -918,6 +938,10 @@ async fn handle_key_event(
             KeyCode::Left => {
                 app.session_manager.switch_prev();
                 if app.session_manager.has_sessions() {
+                    if let Some(session) = app.session_manager.active_session() {
+                        let label = session.label.clone();
+                        app.notifications.retain(|n| n.session_label != label);
+                    }
                     app.view = AppView::Session;
                 }
                 return Ok(KeyAction::Handled);
@@ -926,6 +950,10 @@ async fn handle_key_event(
             KeyCode::Right => {
                 app.session_manager.switch_next();
                 if app.session_manager.has_sessions() {
+                    if let Some(session) = app.session_manager.active_session() {
+                        let label = session.label.clone();
+                        app.notifications.retain(|n| n.session_label != label);
+                    }
                     app.view = AppView::Session;
                 }
                 return Ok(KeyAction::Handled);
@@ -934,6 +962,10 @@ async fn handle_key_event(
             KeyCode::Tab => {
                 app.session_manager.switch_last();
                 if app.session_manager.has_sessions() {
+                    if let Some(session) = app.session_manager.active_session() {
+                        let label = session.label.clone();
+                        app.notifications.retain(|n| n.session_label != label);
+                    }
                     app.view = AppView::Session;
                 }
                 return Ok(KeyAction::Handled);
@@ -981,6 +1013,19 @@ async fn handle_key_event(
                 app.show_help = !app.show_help;
                 return Ok(KeyAction::Handled);
             }
+            // Alt+p: toggle port forwarding manager
+            KeyCode::Char('p') => {
+                if app.session_manager.has_sessions() {
+                    app.view = if app.view == AppView::PortForwarding {
+                        app.port_forward_adding = false;
+                        app.port_forward_input.clear();
+                        AppView::Session
+                    } else {
+                        AppView::PortForwarding
+                    };
+                }
+                return Ok(KeyAction::Handled);
+            }
             // Alt+w: close active session
             KeyCode::Char('w') => {
                 if let Some(idx) = app.session_manager.active_index {
@@ -1022,7 +1067,87 @@ async fn handle_key_event(
         AppView::Monitor => {
             handle_monitor_key(key, app)
         }
+        AppView::PortForwarding => {
+            handle_portfwd_key(key, app)
+        }
     }
+}
+
+fn handle_portfwd_key(
+    key: crossterm::event::KeyEvent,
+    app: &mut App,
+) -> anyhow::Result<KeyAction> {
+    if app.port_forward_adding {
+        match key.code {
+            KeyCode::Esc => {
+                app.port_forward_adding = false;
+                app.port_forward_input.clear();
+            }
+            KeyCode::Enter => {
+                if let Some(active_idx) = app.session_manager.active_index {
+                    if let Some((dir, bind_port, target_host, target_port)) =
+                        portfwd::parse_forward_spec(&app.port_forward_input)
+                    {
+                        if let Some(mgr) = app.port_forward_managers.get_mut(active_idx) {
+                            match dir {
+                                portfwd::ForwardDirection::Local => {
+                                    mgr.add_local("127.0.0.1", bind_port, &target_host, target_port);
+                                }
+                                portfwd::ForwardDirection::Remote => {
+                                    mgr.add_remote("0.0.0.0", bind_port, &target_host, target_port);
+                                }
+                            }
+                        }
+                    }
+                }
+                app.port_forward_adding = false;
+                app.port_forward_input.clear();
+            }
+            KeyCode::Backspace => {
+                app.port_forward_input.pop();
+            }
+            KeyCode::Char(c) => {
+                app.port_forward_input.push(c);
+            }
+            _ => {}
+        }
+        return Ok(KeyAction::Handled);
+    }
+
+    match key.code {
+        KeyCode::Char('a') => {
+            app.port_forward_adding = true;
+            app.port_forward_input.clear();
+        }
+        KeyCode::Char('d') => {
+            if let Some(active_idx) = app.session_manager.active_index {
+                if let Some(mgr) = app.port_forward_managers.get_mut(active_idx) {
+                    if let Some(id) = mgr.selected_id().map(|s| s.to_string()) {
+                        mgr.remove(&id);
+                    }
+                }
+            }
+        }
+        KeyCode::Down => {
+            if let Some(active_idx) = app.session_manager.active_index {
+                if let Some(mgr) = app.port_forward_managers.get_mut(active_idx) {
+                    mgr.select_next();
+                }
+            }
+        }
+        KeyCode::Up => {
+            if let Some(active_idx) = app.session_manager.active_index {
+                if let Some(mgr) = app.port_forward_managers.get_mut(active_idx) {
+                    mgr.select_prev();
+                }
+            }
+        }
+        KeyCode::Esc => {
+            app.view = AppView::Session;
+        }
+        _ => {}
+    }
+    Ok(KeyAction::Handled)
 }
 
 async fn handle_dashboard_key(
@@ -2254,6 +2379,7 @@ mod tests {
             key: None,
             tags: std::collections::HashMap::new(),
             jump_host: None,
+            port_forwards: Vec::new(),
         });
         let (user, host) = parse_target("bastion", &config);
         assert_eq!(user, "ops");
@@ -2271,6 +2397,7 @@ mod tests {
             key: None,
             tags: std::collections::HashMap::new(),
             jump_host: None,
+            port_forwards: Vec::new(),
         });
         config.hosts.push(config::HostEntry {
             name: "db-primary".to_string(),
@@ -2280,6 +2407,7 @@ mod tests {
             key: None,
             tags: std::collections::HashMap::new(),
             jump_host: Some("bastion".to_string()),
+            port_forwards: Vec::new(),
         });
 
         // Find jump host for db-primary
@@ -2306,6 +2434,7 @@ mod tests {
             key: None,
             tags: std::collections::HashMap::new(),
             jump_host: Some("".to_string()),
+            port_forwards: Vec::new(),
         });
 
         let target = config.hosts.iter().find(|h| h.name == "web").unwrap();

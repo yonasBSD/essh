@@ -4,10 +4,12 @@ use ratatui::{
 };
 use crate::session::{Session, SessionState};
 use crate::diagnostics::DiagnosticsSnapshot;
+use crate::portfwd::PortForwardManager;
 use crate::tui::widgets;
+use crate::tui::Notification;
 
 /// Render the session tab bar at the top
-pub fn render_tab_bar(f: &mut Frame, area: Rect, sessions: &[Session], active_index: usize) {
+pub fn render_tab_bar(f: &mut Frame, area: Rect, sessions: &[Session], active_index: usize, notifications: &[Notification]) {
     let now = chrono::Local::now().format("%H:%M:%S").to_string();
     let mut spans: Vec<Span> = vec![
         Span::styled(" ESSH ", Style::default().fg(Color::Cyan).bold()),
@@ -15,6 +17,7 @@ pub fn render_tab_bar(f: &mut Frame, area: Rect, sessions: &[Session], active_in
     ];
 
     for (i, session) in sessions.iter().enumerate() {
+        let has_notifications = notifications.iter().any(|n| n.session_label == session.label);
         if let SessionState::Reconnecting { attempt, max } = &session.state {
             let label = format!("[{}] {} ● Recon. {}/{} ", i + 1, session.label, attempt, max);
             if i == active_index {
@@ -33,6 +36,9 @@ pub fn render_tab_bar(f: &mut Frame, area: Rect, sessions: &[Session], active_in
             let label = format!("[{}] {} ", i + 1, session.label);
             if i == active_index {
                 spans.push(Span::styled(label, Style::default().fg(Color::Yellow).bold()));
+            } else if has_notifications {
+                spans.push(Span::styled(label, Style::default().fg(Color::Cyan).underlined()));
+                spans.push(Span::styled("! ", Style::default().fg(Color::Yellow).bold()));
             } else if session.has_new_output {
                 spans.push(Span::styled(label, Style::default().fg(Color::Cyan).underlined()));
             } else if matches!(session.state, SessionState::Suspended) {
@@ -118,8 +124,14 @@ pub fn render_terminal(f: &mut Frame, area: Rect, session: &Session) {
 }
 
 /// Render the diagnostics status bar at the bottom of a session
-pub fn render_status_bar(f: &mut Frame, area: Rect, session: &Session, diag: Option<&DiagnosticsSnapshot>) {
-    let line = if let Some(d) = diag {
+pub fn render_status_bar(
+    f: &mut Frame,
+    area: Rect,
+    session: &Session,
+    diag: Option<&DiagnosticsSnapshot>,
+    pfm: Option<&PortForwardManager>,
+) {
+    let mut spans = if let Some(d) = diag {
         let rtt_text = match d.rtt_ms {
             Some(rtt) => format!("{:.1}ms", rtt),
             None => "—".to_string(),
@@ -127,7 +139,7 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, session: &Session, diag: Opt
         let quality_str = format!("{:?}", d.quality);
         let q_color = widgets::quality_color(&quality_str);
 
-        Line::from(vec![
+        vec![
             Span::styled("RTT:", Style::default().fg(Color::DarkGray)),
             Span::raw(rtt_text),
             Span::raw("  "),
@@ -144,9 +156,9 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, session: &Session, diag: Opt
             Span::raw("  "),
             Span::styled("Up:", Style::default().fg(Color::DarkGray)),
             Span::raw(widgets::format_duration_short(d.uptime_secs)),
-        ])
+        ]
     } else {
-        Line::from(vec![
+        vec![
             Span::styled(
                 match &session.state {
                     SessionState::Connecting => "Connecting...".to_string(),
@@ -162,10 +174,20 @@ pub fn render_status_bar(f: &mut Frame, area: Rect, session: &Session, diag: Opt
                 },
                 Style::default().fg(Color::DarkGray),
             ),
-        ])
+        ]
     };
 
-    let status = Paragraph::new(line)
+    // Append port forward summary if any
+    if let Some(mgr) = pfm {
+        let summary = mgr.summary();
+        if !summary.is_empty() {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled("Fwd:", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(summary, Style::default().fg(Color::Green)));
+        }
+    }
+
+    let status = Paragraph::new(Line::from(spans))
         .block(Block::default().borders(Borders::TOP).border_style(Style::default().fg(Color::DarkGray)));
     f.render_widget(status, area);
 }

@@ -108,6 +108,7 @@ pub struct SessionConfig {
     pub recording: bool,
     pub max_concurrent: usize,
     pub scrollback_lines: usize,
+    pub notification_patterns: Vec<String>,
 }
 
 impl Default for SessionConfig {
@@ -119,6 +120,7 @@ impl Default for SessionConfig {
             recording: false,
             max_concurrent: 9,
             scrollback_lines: 10000,
+            notification_patterns: Vec::new(),
         }
     }
 }
@@ -218,6 +220,15 @@ impl Default for FleetConfig {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PortForwardConfig {
+    pub direction: String,
+    pub bind_host: String,
+    pub bind_port: u16,
+    pub target_host: String,
+    pub target_port: u16,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HostEntry {
     pub name: String,
     pub hostname: String,
@@ -228,6 +239,8 @@ pub struct HostEntry {
     #[serde(default)]
     pub tags: HashMap<String, String>,
     pub jump_host: Option<String>,
+    #[serde(default)]
+    pub port_forwards: Vec<PortForwardConfig>,
 }
 
 fn default_port() -> u16 {
@@ -517,5 +530,67 @@ mod tests {
     fn test_data_dir() {
         let dir = AppConfig::data_dir();
         assert!(dir.ends_with(".essh"));
+    }
+
+    #[test]
+    fn test_notification_patterns_serde() {
+        let toml_str = r#"
+            [session]
+            notification_patterns = ["ERROR", "build complete", "OOM"]
+        "#;
+        let cfg: AppConfig = toml::from_str(toml_str).expect("parse notification_patterns");
+        assert_eq!(cfg.session.notification_patterns, vec![
+            "ERROR".to_string(),
+            "build complete".to_string(),
+            "OOM".to_string(),
+        ]);
+
+        // Round-trip
+        let serialized = toml::to_string_pretty(&cfg).expect("serialize");
+        let cfg2: AppConfig = toml::from_str(&serialized).expect("deserialize");
+        assert_eq!(cfg2.session.notification_patterns, cfg.session.notification_patterns);
+
+        // Default is empty
+        let default_cfg = AppConfig::default();
+        assert!(default_cfg.session.notification_patterns.is_empty());
+    }
+
+    #[test]
+    fn test_parse_port_forward_config() {
+        let toml_str = r#"
+            [[hosts]]
+            name = "web1"
+            hostname = "192.168.1.10"
+
+            [[hosts.port_forwards]]
+            direction = "local"
+            bind_host = "127.0.0.1"
+            bind_port = 8080
+            target_host = "localhost"
+            target_port = 80
+
+            [[hosts.port_forwards]]
+            direction = "remote"
+            bind_host = "0.0.0.0"
+            bind_port = 3306
+            target_host = "localhost"
+            target_port = 3306
+        "#;
+
+        let cfg: AppConfig = toml::from_str(toml_str).expect("parse port forwards");
+        assert_eq!(cfg.hosts.len(), 1);
+        assert_eq!(cfg.hosts[0].port_forwards.len(), 2);
+
+        let pf0 = &cfg.hosts[0].port_forwards[0];
+        assert_eq!(pf0.direction, "local");
+        assert_eq!(pf0.bind_host, "127.0.0.1");
+        assert_eq!(pf0.bind_port, 8080);
+        assert_eq!(pf0.target_host, "localhost");
+        assert_eq!(pf0.target_port, 80);
+
+        let pf1 = &cfg.hosts[0].port_forwards[1];
+        assert_eq!(pf1.direction, "remote");
+        assert_eq!(pf1.bind_port, 3306);
+        assert_eq!(pf1.target_port, 3306);
     }
 }

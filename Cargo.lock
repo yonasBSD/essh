@@ -956,6 +956,7 @@ dependencies = [
  "futures",
  "hex",
  "ratatui",
+ "regex",
  "rusqlite",
  "russh",
  "russh-keys",

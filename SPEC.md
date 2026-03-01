@@ -493,6 +493,7 @@ essh plugin install <name>          # Install a plugin
 | `Alt+s` | Toggle split-pane view (terminal + monitor side-by-side) |
 | `Alt+[` / `Alt+]` | Adjust split-pane width (5% steps, 20–80% range) |
 | `Alt+m` | Toggle host monitor overlay on active session |
+| `Alt+p` | Toggle port forwarding manager |
 | `Alt+d` | Detach (suspend) active session |
 | `Alt+w` | Close active session |
 | `Alt+h` | Toggle help overlay |
@@ -650,13 +651,13 @@ Wire up the existing `AuthMethod::Agent` variant to discover keys from the local
 
 Add `Alt+f` to open a file browser panel over the active session. List remote files via an SFTP subsystem channel. Support upload, download, mkdir, and delete with a two-pane local/remote layout. Show transfer progress with a bar gauge in the status line. Resume support for large files.
 
-### 13.8 Port Forwarding Manager
+### 13.8 Port Forwarding Manager ✅
 
-Support local (`-L`) and remote (`-R`) TCP port forwards, configurable per-host in `[[hosts]]` entries or toggled live via `Alt+p` which opens a forwarding manager panel. Show active forwards in the session status bar. Forward lifecycle tied to the session — forwards close when the session disconnects.
+**Implemented.** Supports local (`-L`) TCP port forwards toggled live via `Alt+p`, which opens a forwarding manager panel. The panel shows active forwards in a table (Direction, Bind, Target, Status) with Netwatch styling. Press `a` to add a forward using the format `L:bind_port:target_host:target_port`, `d` to delete, `Esc` to close. Active forwards are shown in the session status bar (e.g., `Fwd:L:8080→80`). Forward lifecycle is tied to the session. Local forwarding works by binding a local TCP listener and proxying connections through SSH `channel_open_direct_tcpip` channels. Per-host port forwards can also be configured in `[[hosts]]` entries via `port_forwards` array with `direction`, `bind_host`, `bind_port`, `target_host`, `target_port` fields.
 
-### 13.9 Background Activity Notifications
+### 13.9 Background Activity Notifications ✅
 
-Extend the existing cyan-underline new-output indicator with optional desktop notifications (via `notify-rust` or OS-native mechanisms). Trigger when a background session receives output matching a configurable regex pattern (e.g., `build complete`, `ERROR`, `OOM`). Configurable per-session or globally in `[session]` config.
+**Implemented.** The existing cyan-underline new-output indicator is extended with regex-based notification matching. When a background session receives output matching a configurable pattern, a yellow `!` indicator appears next to the session tab. Patterns are configured globally via `session.notification_patterns` (array of regex strings, e.g. `["ERROR", "build complete", "OOM"]`). Notifications are automatically dismissed when switching to the affected session. The `notify` module provides `NotificationMatcher` with graceful handling of invalid regex patterns. TUI-only notifications (no desktop notification crate dependency).
 
 ### 13.10 Live Fleet Health Dashboard ✅
 
