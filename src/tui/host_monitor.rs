@@ -149,10 +149,10 @@ fn render_load(f: &mut Frame, area: Rect, metrics: &HostMetrics) {
 
 fn render_disks(f: &mut Frame, area: Rect, metrics: &HostMetrics) {
     let header = Row::new(vec![
-        Cell::from(" Mount").style(Style::default().fg(Color::Cyan).bold()),
-        Cell::from("Used").style(Style::default().fg(Color::Cyan).bold()),
-        Cell::from("Avail").style(Style::default().fg(Color::Cyan).bold()),
-        Cell::from("Use%").style(Style::default().fg(Color::Cyan).bold()),
+        Cell::from(" DISK").style(Style::default().fg(Color::Cyan).bold()),
+        Cell::from("Used").style(Style::default().fg(Color::DarkGray)),
+        Cell::from("Avail").style(Style::default().fg(Color::DarkGray)),
+        Cell::from("Use%").style(Style::default().fg(Color::DarkGray)),
     ]).height(1);
 
     let rows: Vec<Row> = metrics.disks.iter().take(15).map(|disk| {
@@ -176,9 +176,8 @@ fn render_disks(f: &mut Frame, area: Rect, metrics: &HostMetrics) {
 
     let table = Table::new(rows, widths)
         .header(header)
-        .block(Block::bordered()
-            .title(" Disk ")
-            .title_style(Style::default().fg(Color::Cyan).bold())
+        .block(Block::default()
+            .borders(Borders::BOTTOM)
             .border_style(Style::default().fg(Color::DarkGray)));
     f.render_widget(table, area);
 }
@@ -216,12 +215,13 @@ fn render_processes(f: &mut Frame, area: Rect, metrics: &HostMetrics, sort: &Pro
         ProcessSort::Memory => "by MEM",
     };
 
+    let header_title = format!(" PROC ({})", sort_label);
     let header = Row::new(vec![
-        Cell::from(" PID").style(Style::default().fg(Color::Cyan).bold()),
-        Cell::from("Name").style(Style::default().fg(Color::Cyan).bold()),
-        Cell::from("CPU%").style(Style::default().fg(Color::Cyan).bold()),
-        Cell::from("MEM%").style(Style::default().fg(Color::Cyan).bold()),
-        Cell::from("RSS").style(Style::default().fg(Color::Cyan).bold()),
+        Cell::from(header_title).style(Style::default().fg(Color::Cyan).bold()),
+        Cell::from("Name").style(Style::default().fg(Color::DarkGray)),
+        Cell::from("CPU%").style(Style::default().fg(Color::DarkGray)),
+        Cell::from("MEM%").style(Style::default().fg(Color::DarkGray)),
+        Cell::from("RSS").style(Style::default().fg(Color::DarkGray)),
     ]).height(1);
 
     let rows: Vec<Row> = procs.iter().skip(scroll).map(|p| {
@@ -242,10 +242,11 @@ fn render_processes(f: &mut Frame, area: Rect, metrics: &HostMetrics, sort: &Pro
         Constraint::Length(10),
     ];
 
-    let title = format!("Top Processes ({})", sort_label);
     let table = Table::new(rows, widths)
         .header(header)
-        .block(Block::bordered().title(title).border_style(Style::default().fg(Color::DarkGray)));
+        .block(Block::default()
+            .borders(Borders::BOTTOM)
+            .border_style(Style::default().fg(Color::DarkGray)));
     f.render_widget(table, area);
 }
 

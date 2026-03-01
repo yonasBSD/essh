@@ -107,11 +107,8 @@ pub fn parse_df(raw: &str) -> Vec<DiskInfo> {
         if parts.len() < 6 {
             continue;
         }
-        // Skip tmpfs, devtmpfs, etc
-        if parts[0].starts_with("tmpfs")
-            || parts[0].starts_with("devtmpfs")
-            || parts[0] == "none"
-        {
+        // Skip pseudo-filesystems with no real storage
+        if parts[0] == "none" || parts[0] == "udev" || parts[0] == "overlay" {
             continue;
         }
         let total: u64 = parts[1].parse().unwrap_or(0) * 1024; // df -P gives 1K blocks
@@ -253,12 +250,14 @@ mod tests {
         let raw = "Filesystem     1024-blocks      Used Available Capacity Mounted on\n\
                     /dev/sda1       102400000  24576000  77824000      24% /\n\
                     tmpfs             8192000         0   8192000       0% /dev/shm\n\
+                    none              8192000         0   8192000       0% /run/lock\n\
                     /dev/sdb1       512000000 419430400  92569600      82% /data\n";
         let disks = parse_df(raw);
-        assert_eq!(disks.len(), 2); // tmpfs should be skipped
+        assert_eq!(disks.len(), 3); // 'none' skipped, tmpfs kept
         assert_eq!(disks[0].mount, "/");
         assert!((disks[0].use_pct - 24.0).abs() < 0.1);
-        assert_eq!(disks[1].mount, "/data");
+        assert_eq!(disks[1].mount, "/dev/shm");
+        assert_eq!(disks[2].mount, "/data");
     }
 
     #[test]
