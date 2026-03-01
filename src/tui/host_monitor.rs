@@ -31,30 +31,34 @@ pub fn render(
     let inner = outer_block.inner(area);
     f.render_widget(outer_block, area);
 
-    // Disk height: 1 header + up to 10 mounts + 1 bottom border
-    let disk_rows = metrics.disks.len().min(10);
-    let disk_height = (disk_rows as u16) + 2; // header + border
-
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(6),            // CPU
-            Constraint::Length(5),            // Memory
-            Constraint::Length(3),            // Load + Uptime
-            Constraint::Length(disk_height),  // Disk (dynamic)
-            Constraint::Length(3),            // Net I/O
-            Constraint::Min(6),              // Processes
-            Constraint::Length(2),            // Footer
+            Constraint::Length(6),   // CPU
+            Constraint::Length(5),   // Memory
+            Constraint::Length(3),   // Load + Uptime
+            Constraint::Min(3),     // Disk (flexible — takes remaining space with processes)
+            Constraint::Length(3),   // Net I/O
+            Constraint::Length(2),   // Footer
         ])
         .split(inner);
+
+    // Split the disk area to give disk and processes each a fair share
+    let disk_proc_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(50), // Disk (top half)
+            Constraint::Percentage(50), // Processes (bottom half)
+        ])
+        .split(chunks[3]);
 
     render_cpu(f, chunks[0], metrics, cpu_history);
     render_memory(f, chunks[1], metrics, mem_history);
     render_load(f, chunks[2], metrics);
-    render_disks(f, chunks[3], metrics);
+    render_disks(f, disk_proc_chunks[0], metrics);
+    render_processes(f, disk_proc_chunks[1], metrics, sort, process_scroll);
     render_network(f, chunks[4], metrics, net_rx_history, net_tx_history);
-    render_processes(f, chunks[5], metrics, sort, process_scroll);
-    render_monitor_footer(f, chunks[6], sort);
+    render_monitor_footer(f, chunks[5], sort);
 }
 
 fn render_cpu(f: &mut Frame, area: Rect, metrics: &HostMetrics, history: &MetricHistory) {
@@ -158,40 +162,39 @@ fn render_load(f: &mut Frame, area: Rect, metrics: &HostMetrics) {
 }
 
 fn render_disks(f: &mut Frame, area: Rect, metrics: &HostMetrics) {
-    // Fixed column widths: Used(10), Avail(10), bar(10), pct(5) = 35 right side
-    // Mount column gets remaining space, minimum 12
-    let mount_width = (area.width as usize).saturating_sub(37).max(12);
+    let header = Row::new(vec![
+        Cell::from(" Mount").style(Style::default().fg(Color::Cyan).bold()),
+        Cell::from("Used").style(Style::default().fg(Color::Cyan).bold()),
+        Cell::from("Avail").style(Style::default().fg(Color::Cyan).bold()),
+        Cell::from("Use%").style(Style::default().fg(Color::Cyan).bold()),
+    ]).height(1);
 
-    let header = Line::from(vec![
-        Span::styled(format!(" {:<mount_width$}", "DISK"), Style::default().fg(Color::Cyan).bold()),
-        Span::styled(format!("{:>10}", "Used"), Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("{:>10}", "Avail"), Style::default().fg(Color::DarkGray)),
-        Span::raw("  "),
-        Span::styled("Use%", Style::default().fg(Color::DarkGray)),
-    ]);
-
-    let mut lines = vec![header];
-    for disk in metrics.disks.iter().take(10) {
+    let rows: Vec<Row> = metrics.disks.iter().take(10).map(|disk| {
         let avail = disk.total_bytes.saturating_sub(disk.used_bytes);
         let bar = widgets::bar_gauge(disk.use_pct, 10);
-        let mount_display: String = if disk.mount.len() > mount_width {
-            format!("…{}", &disk.mount[disk.mount.len() - (mount_width - 1)..])
-        } else {
-            disk.mount.clone()
-        };
-        lines.push(Line::from(vec![
-            Span::raw(format!(" {:<mount_width$}", mount_display)),
-            Span::raw(format!("{:>10}", widgets::format_bytes(disk.used_bytes))),
-            Span::raw(format!("{:>10}", widgets::format_bytes(avail))),
-            Span::raw(" "),
-            Span::styled(bar, Style::default().fg(widgets::pct_color(disk.use_pct))),
-            Span::raw(format!(" {:.0}%", disk.use_pct)),
-        ]));
-    }
+        Row::new(vec![
+            Cell::from(format!(" {}", disk.mount)),
+            Cell::from(widgets::format_bytes(disk.used_bytes)),
+            Cell::from(widgets::format_bytes(avail)),
+            Cell::from(format!("{} {:.0}%", bar, disk.use_pct))
+                .style(Style::default().fg(widgets::pct_color(disk.use_pct))),
+        ])
+    }).collect();
 
-    let block = Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(Color::DarkGray));
-    let paragraph = Paragraph::new(lines).block(block);
-    f.render_widget(paragraph, area);
+    let widths = [
+        Constraint::Min(14),
+        Constraint::Length(10),
+        Constraint::Length(10),
+        Constraint::Length(16),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(Block::bordered()
+            .title(" Disk ")
+            .title_style(Style::default().fg(Color::Cyan).bold())
+            .border_style(Style::default().fg(Color::DarkGray)));
+    f.render_widget(table, area);
 }
 
 fn render_network(f: &mut Frame, area: Rect, metrics: &HostMetrics, rx_history: &MetricHistory, tx_history: &MetricHistory) {
