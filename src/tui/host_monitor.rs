@@ -31,16 +31,20 @@ pub fn render(
     let inner = outer_block.inner(area);
     f.render_widget(outer_block, area);
 
+    // Disk height: 1 header + up to 10 mounts + 1 bottom border
+    let disk_rows = metrics.disks.len().min(10);
+    let disk_height = (disk_rows as u16) + 2; // header + border
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(6),   // CPU
-            Constraint::Length(5),   // Memory
-            Constraint::Length(3),   // Load + Uptime
-            Constraint::Length(12),  // Disk (header + up to 10 mounts + border)
-            Constraint::Length(3),   // Net I/O
-            Constraint::Min(6),     // Processes
-            Constraint::Length(2),   // Footer
+            Constraint::Length(6),            // CPU
+            Constraint::Length(5),            // Memory
+            Constraint::Length(3),            // Load + Uptime
+            Constraint::Length(disk_height),  // Disk (dynamic)
+            Constraint::Length(3),            // Net I/O
+            Constraint::Min(6),              // Processes
+            Constraint::Length(2),            // Footer
         ])
         .split(inner);
 
