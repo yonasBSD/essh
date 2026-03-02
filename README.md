@@ -50,6 +50,14 @@
 
 ---
 
+## 🎬 Demo
+
+![ESSH Demo](demo.gif)
+
+*7 key views: Dashboard → Session Terminal → Host Monitor → Split-Pane → Command Palette → File Browser → Port Forwarding*
+
+---
+
 ## 🖥️ TUI Preview
 
 ### Dashboard — Hosts Tab
