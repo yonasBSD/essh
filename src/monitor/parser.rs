@@ -99,23 +99,71 @@ pub fn parse_loadavg(raw: &str) -> (f64, f64, f64) {
 }
 
 /// Parse `df -P` output into DiskInfo entries.
+///
+/// `df -P` guarantees one-line-per-entry POSIX format, but filesystem names
+/// and mount points can contain spaces (e.g. macOS AppTranslocation paths,
+/// `map auto_home`).  We locate the numeric columns by scanning from the right
+/// side of each line: the mount point is the last field (may contain spaces),
+/// preceded by Capacity%, Available, Used, and 1K-blocks.
 pub fn parse_df(raw: &str) -> Vec<DiskInfo> {
     let mut disks = Vec::new();
     for line in raw.lines().skip(1) {
         // skip header
-        let parts: Vec<&str> = line.split_whitespace().collect();
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // Strategy: split from the right.  The POSIX format is:
+        //   Filesystem  1K-blocks  Used  Available  Capacity  Mounted-on
+        // "Mounted-on" may contain spaces, so we find Capacity% first by
+        // scanning right-to-left for a token matching \d+%.
+        let parts: Vec<&str> = trimmed.split_whitespace().collect();
         if parts.len() < 6 {
             continue;
         }
+
+        // Find the Capacity% column index (right-to-left, looks like "42%" or "100%")
+        let cap_idx = match parts.iter().rposition(|p| {
+            p.ends_with('%') && p.trim_end_matches('%').parse::<u64>().is_ok()
+        }) {
+            Some(i) if i >= 3 => i, // need at least fs, blocks, used, avail before it
+            _ => continue,
+        };
+
+        // Fields before Capacity%
+        let avail_idx = cap_idx - 1;
+        let used_idx = cap_idx - 2;
+        let blocks_idx = cap_idx - 3;
+
+        // Filesystem is everything before blocks_idx (may contain spaces)
+        let fs_name: String = parts[..blocks_idx].join(" ");
+
+        // Mount point is everything after cap_idx (may contain spaces)
+        let mount = if cap_idx + 1 < parts.len() {
+            parts[cap_idx + 1..].join(" ")
+        } else {
+            continue;
+        };
+
         // Skip pseudo-filesystems with no real storage
-        if parts[0] == "none" || parts[0] == "udev" || parts[0] == "overlay" {
+        if fs_name == "none" || fs_name == "udev" || fs_name == "overlay"
+            || fs_name == "devfs" || fs_name.starts_with("map ")
+        {
             continue;
         }
-        let total: u64 = parts[1].parse().unwrap_or(0) * 1024; // df -P gives 1K blocks
-        let used: u64 = parts[2].parse().unwrap_or(0) * 1024;
-        let use_pct_str = parts[4].trim_end_matches('%');
+
+        let total: u64 = parts[blocks_idx].parse().unwrap_or(0) * 1024;
+        let used: u64 = parts[used_idx].parse().unwrap_or(0) * 1024;
+        let _avail: u64 = parts[avail_idx].parse().unwrap_or(0) * 1024;
+        let use_pct_str = parts[cap_idx].trim_end_matches('%');
         let use_pct: f64 = use_pct_str.parse().unwrap_or(0.0);
-        let mount = parts[5].to_string();
+
+        // Skip entries with zero total (virtual mounts)
+        if total == 0 {
+            continue;
+        }
+
         disks.push(DiskInfo {
             mount,
             total_bytes: total,
@@ -258,6 +306,26 @@ mod tests {
         assert!((disks[0].use_pct - 24.0).abs() < 0.1);
         assert_eq!(disks[1].mount, "/dev/shm");
         assert_eq!(disks[2].mount, "/data");
+    }
+
+    #[test]
+    fn test_parse_df_macos_spaces() {
+        let raw = "Filesystem                               512-blocks      Used Available Capacity  Mounted on\n\
+                    /dev/disk3s1s1                            478724992  24017264 256100400     9%    /\n\
+                    devfs                                           405       405         0   100%    /dev\n\
+                    /dev/disk3s5                              478724992 179601016 256100400    42%    /System/Volumes/Data\n\
+                    map auto_home                                     0         0         0   100%    /System/Volumes/Data/home\n\
+                    /Users/mattbot/Downloads/Geekbench 6.app  478724992 179130792 256570640    42%    /private/var/folders/6c/T/AppTranslocation/foo\n";
+        let disks = parse_df(raw);
+        // devfs, map auto_home skipped; Geekbench 6.app (space in fs) should parse OK
+        assert_eq!(disks.len(), 3);
+        assert_eq!(disks[0].mount, "/");
+        assert!((disks[0].use_pct - 9.0).abs() < 0.1);
+        assert_eq!(disks[1].mount, "/System/Volumes/Data");
+        assert!((disks[1].use_pct - 42.0).abs() < 0.1);
+        // Filesystem with space in name
+        assert_eq!(disks[2].mount, "/private/var/folders/6c/T/AppTranslocation/foo");
+        assert!((disks[2].use_pct - 42.0).abs() < 0.1);
     }
 
     #[test]

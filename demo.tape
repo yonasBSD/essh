@@ -9,10 +9,10 @@ Require ./target/release/essh
 
 Set Shell bash
 Set FontFamily "Menlo"
-Set FontSize 15
-Set Width 1800
-Set Height 1000
-Set Padding 15
+Set FontSize 20
+Set Width 2400
+Set Height 1400
+Set Padding 20
 Set Framerate 30
 Set TypingSpeed 70ms
 Set Theme "Catppuccin Mocha"
