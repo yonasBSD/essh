@@ -47,12 +47,12 @@ Sleep 1.5s
 
 Type "/"
 Sleep 400ms
-Type@90ms "local"
+Type@90ms "mattbot"
 Sleep 1.5s
 
-# Connect
+# Connect to remote host
 Enter
-Sleep 3.5s
+Sleep 4s
 
 # ══════════════════════════════════════════════════════════════════════
 #  ACT 2: Sysadmin commands on the remote host
@@ -179,13 +179,13 @@ Sleep 800ms
 Enter
 Sleep 1.5s
 
-# Connect second session to localhost
+# Connect second session to mattbot
 Type "/"
 Sleep 300ms
-Type@90ms "local"
+Type@90ms "mattbot"
 Sleep 600ms
 Enter
-Sleep 3.5s
+Sleep 4s
 
 # Run a command in second session
 Type@75ms "hostname && date && whoami"
