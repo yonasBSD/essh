@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# essh.sh — launcher for the Enterprise SSH Client
+# essh.sh — launcher for the Enhanced SSH Client
 #
 set -euo pipefail
 

@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "essh", version, about = "Enterprise SSH Client")]
+#[command(name = "essh", version, about = "Enhanced SSH Client")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,

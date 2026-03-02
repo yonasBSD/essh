@@ -1,5 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────
-#  ESSH Demo — Enterprise SSH Client
+#  ESSH Demo — Enhanced SSH Client
 #  Real TUI, real SSH to remote host, organic typing
 # ─────────────────────────────────────────────────────────────────────
 

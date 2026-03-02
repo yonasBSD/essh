@@ -1,4 +1,4 @@
-# ESSH — Enterprise SSH Client
+# ESSH — Enhanced SSH Client
 
 ## 1. Overview
 

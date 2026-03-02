@@ -8,14 +8,13 @@
                          ██╔══╝  ╚════██║╚════██║██╔══██║
                          ███████╗███████║███████║██║  ██║
                          ╚══════╝╚══════╝╚══════╝╚═╝  ╚═╝
-                          Enterprise SSH Client for the Terminal
+                          Enhanced SSH Client for the Terminal
 ```
 
 </p>
 
 <p align="center">
   <a href="https://crates.io/crates/essh"><img src="https://img.shields.io/crates/v/essh.svg" alt="crates.io"></a>
-  <a href="https://github.com/matthart1983/essh/actions"><img src="https://img.shields.io/github/actions/workflow/status/matthart1983/essh/ci.yml?branch=main" alt="Build Status"></a>
   <a href="https://github.com/matthart1983/essh/blob/main/LICENSE"><img src="https://img.shields.io/crates/l/essh.svg" alt="License: MIT"></a>
 </p>
 
