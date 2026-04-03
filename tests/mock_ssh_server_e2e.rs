@@ -89,14 +89,60 @@ impl Harness {
 
     fn run_connect_under_pty(&self, script_body: &str) -> CommandResult {
         let script_path = self.write_file(self.home.join("run-connect.sh"), script_body);
+        let pty_runner = r#"
+import os
+import pty
+import select
+import subprocess
+import sys
 
-        let output = Command::new("script")
-            .arg("-q")
-            .arg("/dev/null")
-            .arg("sh")
+script_path = sys.argv[1]
+master, slave = pty.openpty()
+proc = subprocess.Popen(
+    ["sh", script_path],
+    stdin=slave,
+    stdout=slave,
+    stderr=slave,
+    close_fds=True,
+)
+os.close(slave)
+
+chunks = []
+while True:
+    ready, _, _ = select.select([master], [], [], 0.1)
+    if master in ready:
+        try:
+            data = os.read(master, 4096)
+        except OSError:
+            data = b""
+        if not data:
+            break
+        chunks.append(data)
+        continue
+
+    if proc.poll() is not None:
+        while True:
+            try:
+                data = os.read(master, 4096)
+            except OSError:
+                data = b""
+            if not data:
+                break
+            chunks.append(data)
+        break
+
+os.close(master)
+sys.stdout.buffer.write(b"".join(chunks))
+sys.stdout.flush()
+sys.exit(proc.wait())
+"#;
+
+        let output = Command::new("python3")
+            .arg("-c")
+            .arg(pty_runner)
             .arg(&script_path)
             .output()
-            .expect("run script pty wrapper");
+            .expect("run python pty wrapper");
 
         let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
         let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
