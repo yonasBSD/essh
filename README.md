@@ -8,464 +8,333 @@
                          ██╔══╝  ╚════██║╚════██║██╔══██║
                          ███████╗███████║███████║██║  ██║
                          ╚══════╝╚══════╝╚══════╝╚═╝  ╚═╝
-                          Enhanced SSH Client for the Terminal
+                           Enhanced SSH for people with fleets
 ```
 
 </p>
 
 <p align="center">
   <a href="https://crates.io/crates/essh"><img src="https://img.shields.io/crates/v/essh.svg" alt="crates.io"></a>
+  <a href="https://github.com/matthart1983/essh/actions/workflows/ci.yml"><img src="https://github.com/matthart1983/essh/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/matthart1983/essh/blob/main/LICENSE"><img src="https://img.shields.io/crates/l/essh.svg" alt="License: MIT"></a>
 </p>
 
 <p align="center">
-  <b>A pure-Rust SSH client with a rich TUI — concurrent sessions, real-time host monitoring, fleet management, and connection diagnostics. All from your terminal.</b>
+  <b>One terminal. Multiple SSH sessions. Live host insight. Zero context switching.</b>
+</p>
+
+<p align="center">
+  ESSH is a pure-Rust SSH client with a sharp, Netwatch-inspired TUI for operators who want more than a bare shell.<br>
+  Connect fast, watch host health in real time, move files, manage forwards, and keep a clean audit trail without leaving the terminal.
 </p>
 
 ---
 
-## ✨ Feature Highlights
+## Why ESSH
 
-| Feature | Description |
-|---|---|
-| **Pure-Rust SSH** | Built on [russh](https://github.com/warp-tech/russh) — no libssh/OpenSSH dependency. Public key, password, & SSH agent auth with TOFU host key verification. |
-| **Concurrent Sessions** | Up to 9 simultaneous SSH sessions with instant `Alt+1-9` switching, `Alt+←/→` cycling, and `Alt+Tab` last-used recall. |
-| **Virtual Terminal** | Full ANSI escape sequence rendering via `vt100::Parser` — colors, cursor positioning, and alternate screen all work correctly. |
-| **Host Monitor** | Real-time remote htop: CPU sparklines, memory bars, disk usage, network I/O, and top processes — all collected over SSH exec channels (no agent required). |
-| **Connection Diagnostics** | Live RTT, throughput (↑/↓), packet loss, and a 5-tier connection quality score per session. JSONL diagnostic logs for replay. |
-| **Fleet Management** | Tag-based host groups, bulk command execution with parallel fan-out, and SSH config import. |
-| **Live Fleet Health** | Background TCP probes with per-host latency sparklines and colour-coded status (green/yellow/red). Configurable probe interval. |
-| **Host Search & Filter** | Press `/` to live-filter hosts by name, hostname, tags, or status. Navigate filtered results with `↑`/`↓`. |
-| **Auto-Reconnect** | Exponential backoff reconnection on disconnect (2s → 30s cap). Scrollback preserved across reconnects. Tab bar shows `● Recon. 2/5`. |
-| **Session Recording** | Record terminal I/O to asciicast v2 files. Replay with `essh session replay <id>` — pause, speed control (0.25×–16×), and quit. |
-| **Audit Logging** | Structured JSON audit trail — connection attempts, auth results, host key events, session lifecycle. |
-| **Split-Pane View** | `Alt+s` splits terminal + host monitor side-by-side. Adjustable width with `Alt+[`/`Alt+]` (20–80% range). |
-| **Jump Host / ProxyJump** | Connect through bastion hosts via `jump_host` config. SSH-over-SSH using `direct-tcpip` channels. Status bar shows hop path. |
-| **File Transfer** | `Alt+f` opens a two-pane file browser. Upload/download via SSH exec channels. Transfer progress bar. |
-| **Port Forwarding** | `Alt+p` manages local TCP port forwards. Live add/remove with SSH `direct-tcpip` proxy. Active forwards shown in status bar. |
-| **Background Notifications** | Regex-based alerts when background sessions match patterns (e.g. `ERROR`, `build complete`). Yellow `!` tab indicator. |
-| **Command Palette** | `Ctrl+p` opens a fuzzy-matched command palette — jump to hosts, sessions, views, or actions instantly. Multi-word scoring with prefix bonuses. |
-| **TUI Dashboard** | 4-tab dashboard (Sessions, Hosts, Fleet, Config) with a Netwatch-inspired Cyan/Yellow/DarkGray aesthetic. |
+Most SSH tools stop at "you are connected." ESSH is built for what happens after that.
+
+- Work across multiple hosts without juggling terminal windows.
+- See CPU, memory, disks, network, and process pressure while you are on the box.
+- Keep connection diagnostics, recordings, file transfer, and port forwarding in the same workflow.
+- Stay in a terminal-first interface that feels fast, dense, and operational.
+
+ESSH is for people who manage real systems and want their SSH client to act like an operations tool, not just a transport.
 
 ---
 
-## 🎬 Demo
+## What Makes It Hit
+
+| Pillar | What You Get |
+|---|---|
+| **Fleet-first workflow** | Browse hosts, filter by tag, jump between sessions, and fan commands across groups from one place. |
+| **Live machine awareness** | Built-in host monitor shows CPU, memory, disk, load, network throughput, and top processes in real time. |
+| **Operational depth** | Port forwarding, file transfer, jump hosts, notifications, recordings, reconnects, and audit logs are part of the product, not bolted on later. |
+| **Pure-Rust stack** | Built on [`russh`](https://github.com/warp-tech/russh), [`ratatui`](https://github.com/ratatui/ratatui), and [`vt100`](https://github.com/doy/vt100-rs) with no OpenSSH UI dependency. |
+
+---
+
+## Demo
 
 ![ESSH Demo](demo.gif)
 
-*7 key views: Dashboard → Session Terminal → Host Monitor → Split-Pane → Command Palette → File Browser → Port Forwarding*
+<p align="center">
+  <sub>Dashboard, multi-session terminal, host monitor, split pane, command palette, file browser, and port forwarding in one flow.</sub>
+</p>
 
 ---
 
-## 🖥️ TUI Preview
+## Install Fast
 
-### Dashboard — Hosts Tab
-
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│ ESSH │ [1] Sessions  [2] Hosts  [3] Fleet  [4] Config  │ ?:Help │ 14:32:07 │
-├──────────────────────────────────────────────────────────────────────┤
-│ Hosts (4)                                                            │
-│                                                                      │
-│  Name            Hostname             Port  User     Status          │
-│ ─────────────────────────────────────────────────────────────────── │
-│» web-prod-1      10.0.1.10            22    deploy   ● Online        │
-│  web-prod-2      10.0.1.11            22    deploy   ● Online        │
-│  db-primary      10.0.2.10            22    dba      ● Online        │
-│  staging-1       10.0.3.5             2222  matt     ○ Unknown       │
-│                                                                      │
-├──────────────────────────────────────────────────────────────────────┤
-│ Enter:Connect  Alt+1-9:Session  a:Add  /:Search  r:Refresh  q:Quit │
-└──────────────────────────────────────────────────────────────────────┘
-```
-
-### Session View — Active Terminal
-
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│ ESSH ── [1] web-prod-1  [2] db-primary  [3] staging-1 ── 14:33:42 │
-├──────────────────────────────────────────────────────────────────────┤
-│ deploy@web-prod-1:~$ htop                                          │
-│                                                                      │
-│  (full terminal output — colors, cursor, alternate screen)          │
-│                                                                      │
-│                                                                      │
-│                                                                      │
-├──────────────────────────────────────────────────────────────────────┤
-│ RTT:12.3ms  ↑1.2KB/s  ↓48.5KB/s  Loss:0.0%  ●Excellent  Up:1h24m │
-├──────────────────────────────────────────────────────────────────────┤
-│ Alt+←→:Switch  Alt+s:Split  Alt+f:Files  Alt+p:Fwd  Alt+d:Detach  Alt+w:Close│
-└──────────────────────────────────────────────────────────────────────┘
-```
-
-### Host Monitor — Remote htop (`Alt+m`)
-
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│ ESSH ── [1] web-prod-1  [2] db-primary ────────────── 14:34:18     │
-├──────────────────────────────────────────────────────────────────────┤
-│ CPU   23.4%  ▁▂▃▃▂▅▃▂▁▂▃▄▅▆▅▃▂▁▂▃▃▂▁▁▂▃▅▆▅▃▂▂▃▃▂▁▂▃▃▂          │
-│       ████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ 23%                  │
-│       Core 0: ██████░░░░░  28%    Core 1: █████░░░░░░  19%          │
-│       Core 2: ███████░░░░  31%    Core 3: █████░░░░░░  15%          │
-│──────────────────────────────────────────────────────────────────── │
-│ MEM   3.2G / 8.0G (40%)  Swap: 0B / 2.0G                          │
-│       ▁▁▂▂▂▂▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃▃                  │
-│       ████████████████░░░░░░░░░░░░░░░░░░░░░░░░ 40%                  │
-│──────────────────────────────────────────────────────────────────── │
-│ LOAD  0.82  0.64  0.55    UPTIME  14d 6h 32m                      │
-│──────────────────────────────────────────────────────────────────── │
-│ DISK  /               12.4G      7.6G ██████████ 62%                │
-│       /data           84.2G    115.8G █████░░░░░ 42%                │
-│──────────────────────────────────────────────────────────────────── │
-│ NET   RX ▁▂▃▂▁▂▃▅▃▂▁ 48.5KB/s   TX ▁▁▁▂▁▁▁▂▁▁▁ 1.2KB/s          │
-│──────────────────────────────────────────────────────────────────── │
-│ Top Processes (by CPU)                                              │
-│  PID     Name                      CPU%    MEM%    RSS              │
-│  1842    node                       8.2     3.1    256M             │
-│  2104    nginx                      4.1     0.8     64M             │
-│  3921    postgres                   3.7     5.2    420M             │
-│  1203    containerd                 2.1     1.4    112M             │
-├──────────────────────────────────────────────────────────────────────┤
-│ Esc:Terminal  s:Sort(→mem)  p:Pause  r:Refresh  ↑↓:Scroll          │
-└──────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 📦 Installation
-
-### From crates.io
+### crates.io
 
 ```bash
 cargo install essh
 ```
 
-### From Source
+### from source
 
 ```bash
 git clone https://github.com/matthart1983/essh.git
 cd essh
 cargo build --release
-# Binary is at ./target/release/essh
+./target/release/essh
 ```
 
 ---
 
-## 🚀 Quick Start
+## First 60 Seconds
 
 ```bash
-# Launch the TUI dashboard
+# Launch the dashboard
 essh
 
-# Direct connect to a host
-essh connect user@hostname
+# Direct connect
+essh connect user@host
 
-# Connect with a specific key
-essh connect user@hostname -i ~/.ssh/id_ed25519
+# Use a specific key
+essh connect user@host -i ~/.ssh/id_ed25519
 
-# Connect with password authentication
-essh connect user@hostname --password
-
-# Import hosts from your SSH config
+# Pull hosts from your existing SSH config
 essh hosts import
 
-# Run a command across a host group
+# Run a command across a tagged group
 essh run web-servers -- uptime
 ```
 
-On first launch, ESSH creates `~/.essh/` with a default `config.toml`. Navigate the Hosts tab, select a host, and press `Enter` to connect.
+On first launch, ESSH creates `~/.essh/` and gives you a working config, SQLite host cache, diagnostics directory, and audit log path.
 
 ---
 
-## ⚙️ Configuration
+## The Product In One Screen
 
-ESSH uses a TOML config file at `~/.essh/config.toml`. Initialize or edit it:
-
-```bash
-essh config init    # Create default config
-essh config edit    # Open in $EDITOR
-essh config show    # Print current config
+```text
+┌─ ESSH ── [1] web-prod  [2] db-primary  [3] staging ───────────────┐
+│ deploy@web-prod:~$                                                │
+│                                                                   │
+│   journalctl -u api -f                                            │
+│                                                                   │
+├───────────────────────────────────────────────────────────────────┤
+│ RTT 12.3ms   ↑1.2KB/s   ↓48.5KB/s   Loss 0.0%   ● Excellent       │
+├───────────────────────────────────────────────────────────────────┤
+│ CPU  23%  ▁▂▃▄▅▆▅▃▂▁     MEM  40%  ████████████████░░░░░░░░░       │
+│ LOAD 0.82 0.64 0.55      NET  RX 48.5KB/s   TX 1.2KB/s            │
+│ DISK / 62%               Top: node, nginx, postgres               │
+└───────────────────────────────────────────────────────────────────┘
 ```
 
-### Example Configuration
+The idea is simple: terminal fidelity when you need a shell, operational signal when you need context.
+
+---
+
+## Feature Highlights
+
+### Multi-Session Without the Mess
+
+- Up to 9 concurrent SSH sessions.
+- Instant switching with `Alt+1-9`, `Alt+←/→`, and `Alt+Tab`.
+- Split-pane terminal plus host monitor with `Alt+s`.
+- Scrollback preserved across reconnects.
+
+### Remote Insight Without an Agent
+
+- CPU, memory, load, disk, network, uptime, and top processes.
+- Sparkline history and bar gauges tuned for quick scanning.
+- Collected over SSH exec channels, so there is nothing extra to install remotely.
+
+### Fleet Features That Actually Matter
+
+- Import hosts from `~/.ssh/config`.
+- Tag hosts and define groups.
+- Run commands across a group with parallel fan-out.
+- Background fleet probes with latency history and color-coded state.
+
+### Built For Real SSH Work
+
+- Public key, password, and SSH agent auth.
+- TOFU host key verification with `strict`, `prompt`, and `auto` modes.
+- Jump host / ProxyJump support.
+- Local port forwards, live add and remove.
+- Two-pane file browser for upload and download.
+
+### Built-In Safety Nets
+
+- Exponential backoff reconnects.
+- Structured JSON audit log.
+- Session diagnostics written as JSONL.
+- Optional asciicast v2 recording and replay.
+- Regex-based background notifications for important output.
+
+---
+
+## Ease Of Use, Not Ceremony
+
+### Import what you already have
+
+```bash
+essh hosts import
+```
+
+### Bring structure to a messy fleet
 
 ```toml
-[general]
-default_user = "deploy"
-default_key = "~/.ssh/id_ed25519"
-tofu_policy = "prompt"       # strict | prompt | auto
-cache_ttl = "30d"
-log_level = "info"
-
-[diagnostics]
-enabled = true
-display = "status_bar"       # status_bar | overlay | hidden
-export_format = "jsonl"
-keepalive_interval = 15
-
-[host_monitor]
-enabled = true
-cpu_interval = 1
-memory_interval = 2
-process_count = 15
-history_samples = 60
-
-[session]
-auto_reconnect = true
-reconnect_max_retries = 5
-max_concurrent = 9
-scrollback_lines = 10000
-recording = false            # Set true to record sessions as asciicast v2
-notification_patterns = []
-
-[fleet]
-probe_enabled = true
-probe_interval = 60          # Seconds between TCP health probes
-probe_timeout = 5            # Seconds before probe timeout
-latency_history_samples = 30 # Sparkline data points per host
-
-[security]
-min_key_bits = 3072
-allowed_ciphers = [
-    "chacha20-poly1305@openssh.com",
-    "aes256-gcm@openssh.com",
-    "aes128-gcm@openssh.com",
-]
-allowed_kex = [
-    "curve25519-sha256",
-    "curve25519-sha256@libssh.org",
-]
-
-[audit]
-enabled = true
-
-# Define hosts
 [[hosts]]
 name = "web-prod-1"
 hostname = "10.0.1.10"
-port = 22
 user = "deploy"
-key = "~/.ssh/deploy_key"
+key = "~/.ssh/id_ed25519"
 
 [hosts.tags]
 env = "production"
 role = "web"
 
-[[hosts]]
-name = "db-primary"
-hostname = "10.0.2.10"
-user = "dba"
-jump_host = "web-prod-1"
-
-[hosts.tags]
-env = "production"
-role = "database"
-
-# Define host groups (matched by tags)
 [[host_groups]]
 name = "web-servers"
 
 [host_groups.match_tags]
 role = "web"
-
-[host_groups.defaults]
-user = "deploy"
-key = "~/.ssh/deploy_key"
 ```
 
-### Data Directory Structure
+### Run a fleet command without leaving the toolchain
 
+```bash
+essh run web-servers -- sudo systemctl status nginx
 ```
-~/.essh/
-├── config.toml          # Main configuration
-├── cache.db             # SQLite host key & host cache
-├── audit.log            # Structured JSON audit log
-├── sessions/            # Per-session diagnostic logs (JSONL)
-├── recordings/          # Session recordings (if enabled)
-└── known_cas/           # Trusted CA certificates
+
+### Replay what happened later
+
+```bash
+essh session list
+essh session replay <session-id>
 ```
 
 ---
 
-## ⌨️ Keyboard Reference
+## Keyboard Flow
 
-### Global (all views)
+### Global
 
 | Key | Action |
 |---|---|
-| `?` / `Alt+h` | Toggle help overlay |
-| `Alt+1` – `Alt+9` | Jump to session N |
-| `Alt+←` / `Alt+→` | Cycle to previous / next session |
-| `Alt+Tab` | Switch to last-used session |
-| `Alt+m` | Toggle host monitor |
+| `?` / `Alt+h` | Help overlay |
+| `Alt+1` - `Alt+9` | Jump to session |
+| `Alt+←` / `Alt+→` | Cycle sessions |
+| `Alt+Tab` | Last-used session |
+| `Ctrl+p` | Command palette |
 | `Alt+d` | Detach to dashboard |
-| `Alt+w` | Close active session |
-| `Alt+r` | Rename active session |
-| `Alt+s` | Toggle split-pane view |
-| `Alt+[` / `Alt+]` | Adjust split-pane width |
-| `Alt+f` | File browser (upload/download) |
-| `Alt+p` | Port forwarding manager |
-| `Ctrl+p` | Command palette (fuzzy finder) |
+| `Alt+w` | Close session |
+
+### Session Ops
+
+| Key | Action |
+|---|---|
+| `Alt+m` | Host monitor |
+| `Alt+s` | Split pane |
+| `Alt+[` / `Alt+]` | Resize split |
+| `Alt+f` | File browser |
+| `Alt+p` | Port forwarding |
+| `Alt+r` | Rename tab |
 
 ### Dashboard
 
 | Key | Action |
 |---|---|
-| `1` – `4` | Switch tab (Sessions / Hosts / Fleet / Config) |
-| `j` / `k` / `↑` / `↓` | Navigate host list |
-| `Enter` | Connect to selected host |
+| `1` - `4` | Switch tabs |
+| `j` / `k` / `↑` / `↓` | Navigate hosts |
+| `Enter` | Connect |
+| `/` | Live filter |
 | `a` | Add host |
-| `/` | Live search/filter hosts |
-| `r` | Refresh host list |
-| `d` | Delete selected host |
-| `q` / `Ctrl+c` | Quit |
-
-### Session Terminal
-
-| Key | Action |
-|---|---|
-| *(all keys)* | Forwarded directly to the remote shell |
-
-### Host Monitor
-
-| Key | Action |
-|---|---|
-| `Esc` | Return to terminal view |
-| `s` | Toggle sort (CPU ↔ Memory) |
-| `p` | Pause metric collection |
-| `r` | Force refresh |
-| `↑` / `↓` | Scroll process list |
+| `d` | Delete host |
+| `r` | Refresh |
 
 ---
 
-## 📋 CLI Reference
-
-```
-essh                                  Launch TUI dashboard
-essh connect <user@host>              Direct SSH connection
-  -p, --port <PORT>                     Port (default: 22)
-  -i, --identity <FILE>                 Private key file
-  --password                            Use password auth
-
-essh hosts list [--tag key=value]     List cached hosts
-essh hosts add <hostname>             Add host to cache
-  -p, --port <PORT>                     Port (default: 22)
-  -n, --name <NAME>                     Display name
-  -u, --user <USER>                     Username
-  --tag <key=value>                     Tag (repeatable)
-essh hosts remove <hostname>          Remove host from cache
-essh hosts import [path]              Import from SSH config
-essh hosts health [--group <name>]    Run TCP health checks
-
-essh keys list                        List cached keys
-essh keys add <path> [-n name]        Add a private key
-essh keys remove <name>               Remove a key
-
-essh session list                     List session recordings
-essh session replay <id>              Replay recorded session (asciicast)
-                                        Space:pause  +/-:speed  q:quit
-
-essh diag <session_id>                Show session diagnostics
-
-essh run <group> -- <command>         Execute across a host group
-
-essh config init                      Initialize default config
-essh config edit                      Open config in $EDITOR
-essh config show                      Print current config
-
-essh audit tail [-l lines]            Show recent audit entries
-```
-
----
-
-## 🔐 Security
-
-- **TOFU Host Key Verification** — Three policies: `strict` (reject unknown), `prompt` (ask user), `auto` (trust on first use). Host key fingerprints are cached in SQLite.
-- **Configurable Cipher Suites** — Restrict allowed ciphers, key exchange algorithms, and MACs.
-- **Minimum Key Strength** — Enforce minimum key bit length (default: 3072).
-- **Structured Audit Trail** — Every connection attempt, auth result, and host key event is logged as structured JSON.
-
----
-
-## 🏗️ Architecture & Tech Stack
-
-| Layer | Crate | Purpose |
-|---|---|---|
-| SSH Protocol | `russh`, `russh-keys` | Pure-Rust SSH2 client implementation |
-| TUI Framework | `ratatui`, `crossterm` | Terminal UI rendering and input |
-| Terminal Emulation | `vt100` | Virtual terminal with ANSI escape parsing |
-| Database | `rusqlite` (bundled) | Host key cache, host/key management |
-| Async Runtime | `tokio` | Async I/O, task spawning, timers |
-| CLI | `clap` (derive) | Command-line argument parsing |
-| Serialization | `serde`, `serde_json`, `toml` | Config, audit logs, diagnostics |
-| Crypto | `sha2`, `base64` | Fingerprint hashing |
-| Utilities | `chrono`, `uuid`, `dirs`, `thiserror`, `anyhow` | Time, IDs, paths, errors |
-| Pattern Matching | `regex` | Background notification pattern matching |
-
-### Module Structure
-
-```
-src/
-├── main.rs              # Entry point, TUI event loop, CLI dispatch, auto-reconnect
-├── cli/                 # Clap command definitions
-├── config/              # TOML config parsing & defaults (incl. [fleet] section)
-├── ssh/                 # russh client, auth (key/password/agent), host key verification
-├── session/             # Session state, VirtualTerminal (vt100), SessionManager
-├── tui/                 # TUI views
-│   ├── dashboard.rs     # Dashboard with 4 tabs, host search/filter bar
-│   ├── session_view.rs  # Terminal renderer, tab bar, status bar
-│   ├── host_monitor.rs  # CPU/MEM/Disk/Net/Process panels
-│   ├── filebrowser_view.rs  # Two-pane file browser UI
-│   ├── portfwd_view.rs      # Port forwarding manager panel
-│   ├── help.rs          # Help overlay popup
-│   ├── command_palette.rs  # Fuzzy-matched command palette (Ctrl+P)
-│   └── widgets.rs       # Sparklines, bar gauges, formatters
-├── filetransfer/        # Two-pane file browser, upload/download via SSH exec
-├── fleet/               # Live fleet health — background TCP probes, latency tracking
-├── notify/              # Background activity notification matching (regex)
-├── portfwd/             # Port forwarding manager, local TCP proxy
-├── recording/           # Session recording (asciicast v2) & replay
-├── monitor/             # Remote host metric collection
-│   ├── collector.rs     # SSH exec-based metric gathering
-│   ├── parser.rs        # /proc & command output parsing
-│   └── history.rs       # Sparkline ring buffers
-├── diagnostics/         # Connection quality engine, JSONL logging
-├── cache/               # SQLite host key & host/key CRUD
-├── audit/               # Structured JSON audit logger
-└── event.rs             # Async event handler (keys, ticks, SSH data)
-```
-
----
-
-## 🤝 Contributing
-
-Contributions are welcome! Please:
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/my-feature`)
-3. Make your changes with tests (`cargo test`)
-4. Ensure formatting (`cargo fmt`) and lints pass (`cargo clippy`)
-5. Open a pull request
-
-### Building & Testing
+## CLI Cheat Sheet
 
 ```bash
-cargo build              # Debug build
-cargo build --release    # Release build
-cargo test               # Run all tests (154 tests)
-cargo clippy             # Lint checks
-cargo fmt --check        # Format check
+essh                                  # launch dashboard
+essh connect user@host                # direct SSH session
+essh hosts list                       # list cached hosts
+essh hosts import                     # import from ~/.ssh/config
+essh keys list                        # list cached keys
+essh diag <session-id>                # inspect diagnostics
+essh session list                     # list recordings
+essh session replay <session-id>      # replay a recording
+essh audit tail --lines 20            # inspect recent audit events
+essh config show                      # print active config
 ```
 
 ---
 
-## 📄 License
+## Configuration
 
-MIT — see [LICENSE](LICENSE) for details.
+ESSH stores its state in `~/.essh/`.
+
+```text
+~/.essh/
+├── config.toml      # main configuration
+├── cache.db         # host and key cache
+├── audit.log        # structured audit trail
+├── sessions/        # per-session diagnostics logs
+├── recordings/      # asciicast recordings
+└── known_cas/       # trusted certificate authorities
+```
+
+Useful commands:
+
+```bash
+essh config init
+essh config edit
+essh config show
+```
+
+If you want the full configuration and architecture spec, see [SPEC.md](SPEC.md).
+
+---
+
+## Security
+
+- Host keys are verified and cached.
+- TOFU policy is configurable: `strict`, `prompt`, or `auto`.
+- Allowed ciphers and KEX algorithms can be restricted.
+- Audit events are written as structured JSON.
+- Session diagnostics and recordings are explicit, inspectable artifacts.
+
+ESSH is built to give operators more visibility without hiding what the tool is doing on their behalf.
+
+---
+
+## Build And Validate
+
+```bash
+cargo build
+cargo test
+cargo clippy --all-targets --all-features -- -D warnings
+cargo fmt --check
+```
+
+GitHub Actions runs the same core checks on pushes and pull requests to `main`.
+
+---
+
+## Contributing
+
+Contributions are welcome.
+
+1. Fork the repo.
+2. Create a branch.
+3. Make the change.
+4. Run `cargo test`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo fmt --check`.
+5. Open a pull request.
+
+---
+
+## License
+
+MIT. See [LICENSE](LICENSE).
 
 ---
 
 <p align="center">
-  <sub>Built with 🦀 Rust — inspired by the Netwatch aesthetic</sub>
+  <sub>ESSH is terminal-native SSH with a little more ambition.</sub>
 </p>
