@@ -33,7 +33,7 @@ use diagnostics::DiagnosticsEngine;
 use event::{AppEvent, EventHandler};
 use notify::NotificationMatcher;
 use session::{Session, SessionState};
-use ssh::{AuthMethod, ConnectConfig, SshClient, SshSession};
+use ssh::{AuthMethod, ConnectConfig, SshClient, SshError, SshSession};
 use tui::{App, AppView, DashboardTab, HostDisplay, HostStatus, Notification};
 
 // ---------------------------------------------------------------------------
@@ -1784,6 +1784,96 @@ fn handle_monitor_key(key: crossterm::event::KeyEvent, app: &mut App) -> anyhow:
     Ok(KeyAction::Handled)
 }
 
+fn ssh_agent_available() -> bool {
+    std::env::var("SSH_AUTH_SOCK").is_ok()
+}
+
+fn configured_auth_method(
+    host_key: Option<&str>,
+    default_key: Option<&str>,
+    has_ssh_agent: bool,
+) -> Option<AuthMethod> {
+    if let Some(key) = host_key {
+        let expanded = shellexpand::tilde(key).to_string();
+        Some(AuthMethod::KeyFile(expanded.into()))
+    } else if let Some(key) = default_key {
+        let expanded = shellexpand::tilde(key).to_string();
+        Some(AuthMethod::KeyFile(expanded.into()))
+    } else if has_ssh_agent {
+        Some(AuthMethod::Agent)
+    } else {
+        None
+    }
+}
+
+fn prompt_password_auth(username: &str, hostname: &str) -> anyhow::Result<AuthMethod> {
+    let prompt = format!("{}@{}'s password: ", username, hostname);
+    let password = prompt_password(&prompt)?;
+    Ok(AuthMethod::Password(password))
+}
+
+fn prompt_password_auth_from_tui(username: &str, hostname: &str) -> anyhow::Result<AuthMethod> {
+    let _restore_tui = scopeguard::guard((), |_| {
+        io::stdout().execute(EnterAlternateScreen).ok();
+        terminal::enable_raw_mode().ok();
+    });
+
+    terminal::disable_raw_mode()?;
+    io::stdout().execute(LeaveAlternateScreen)?;
+
+    prompt_password_auth(username, hostname)
+}
+
+fn should_retry_with_password(auth: &AuthMethod, err: &SshError) -> bool {
+    !matches!(auth, AuthMethod::Password(_)) && matches!(err, SshError::Auth(_))
+}
+
+async fn connect_session_for_host(
+    app: &mut App,
+    config: &AppConfig,
+    host: &HostDisplay,
+    connect_config: &ConnectConfig,
+) -> Result<(SshSession, String, Option<String>), SshError> {
+    let jump_host_name = config
+        .hosts
+        .iter()
+        .find(|h| h.name == host.name || h.hostname == host.hostname)
+        .and_then(|h| h.jump_host.as_deref())
+        .filter(|j| !j.is_empty())
+        .map(|s| s.to_string());
+
+    if let Some(ref jump_name) = jump_host_name {
+        let jump_entry = config
+            .hosts
+            .iter()
+            .find(|h| h.name == *jump_name || h.hostname == *jump_name);
+        let jump_hostname = jump_entry
+            .map(|e| e.hostname.clone())
+            .unwrap_or_else(|| jump_name.clone());
+        let jump_port = jump_entry.map(|e| e.port).unwrap_or(22);
+        let jump_user = jump_entry
+            .and_then(|e| e.user.clone())
+            .or_else(|| config.general.default_user.clone())
+            .unwrap_or_else(whoami);
+        let jump_auth = jump_entry
+            .and_then(|e| e.key.as_ref())
+            .map(|k| AuthMethod::KeyFile(shellexpand::tilde(k).to_string().into()))
+            .unwrap_or_else(|| connect_config.auth.clone());
+
+        let jump_config = ConnectConfig {
+            hostname: jump_hostname,
+            port: jump_port,
+            username: jump_user,
+            auth: jump_auth,
+        };
+
+        app.set_status(format!("Connecting via jump host {}...", jump_name));
+        SshClient::connect_via_jump(&jump_config, connect_config).await
+    } else {
+        SshClient::connect(connect_config).await
+    }
+}
+
 async fn open_session(
     app: &mut App,
     config: &AppConfig,
@@ -1811,22 +1901,22 @@ async fn open_session(
         config.general.default_user.clone().unwrap_or_else(whoami)
     };
 
-    let auth = if let Some(ref key) = host_entry.and_then(|e| e.key.as_ref()) {
-        let expanded = shellexpand::tilde(key).to_string();
-        AuthMethod::KeyFile(expanded.into())
-    } else if let Some(ref key) = config.general.default_key {
-        let expanded = shellexpand::tilde(key).to_string();
-        AuthMethod::KeyFile(expanded.into())
-    } else if std::env::var("SSH_AUTH_SOCK").is_ok() {
-        AuthMethod::Agent
-    } else {
-        app.set_status(
-            "No key or ssh-agent available. Set general.default_key in config.".to_string(),
-        );
-        return Ok(());
+    let auth = match configured_auth_method(
+        host_entry.and_then(|entry| entry.key.as_deref()),
+        config.general.default_key.as_deref(),
+        ssh_agent_available(),
+    ) {
+        Some(auth) => auth,
+        None => match prompt_password_auth_from_tui(&user, &host.hostname) {
+            Ok(auth) => auth,
+            Err(err) => {
+                app.set_status(format!("Password prompt failed: {}", err));
+                return Ok(());
+            }
+        },
     };
 
-    let connect_config = ConnectConfig {
+    let mut connect_config = ConnectConfig {
         hostname: host.hostname.clone(),
         port: host.port,
         username: user.clone(),
@@ -1867,46 +1957,26 @@ async fn open_session(
 
     app.view = AppView::Session;
 
-    // Resolve jump host chain from config
-    let jump_host_name = config
-        .hosts
-        .iter()
-        .find(|h| h.name == host.name || h.hostname == host.hostname)
-        .and_then(|h| h.jump_host.as_deref())
-        .filter(|j| !j.is_empty())
-        .map(|s| s.to_string());
-
-    let connect_result = if let Some(ref jump_name) = jump_host_name {
-        // Resolve jump host config
-        let jump_entry = config
-            .hosts
-            .iter()
-            .find(|h| h.name == *jump_name || h.hostname == *jump_name);
-        let jump_hostname = jump_entry
-            .map(|e| e.hostname.clone())
-            .unwrap_or_else(|| jump_name.clone());
-        let jump_port = jump_entry.map(|e| e.port).unwrap_or(22);
-        let jump_user = jump_entry
-            .and_then(|e| e.user.clone())
-            .or_else(|| config.general.default_user.clone())
-            .unwrap_or_else(whoami);
-        let jump_auth = jump_entry
-            .and_then(|e| e.key.as_ref())
-            .map(|k| AuthMethod::KeyFile(shellexpand::tilde(k).to_string().into()))
-            .unwrap_or_else(|| connect_config.auth.clone());
-
-        let jump_config = ConnectConfig {
-            hostname: jump_hostname,
-            port: jump_port,
-            username: jump_user,
-            auth: jump_auth,
-        };
-
-        app.set_status(format!("Connecting via jump host {}...", jump_name));
-        SshClient::connect_via_jump(&jump_config, &connect_config).await
-    } else {
-        SshClient::connect(&connect_config).await
-    };
+    let mut connect_result = connect_session_for_host(app, config, host, &connect_config).await;
+    if matches!(connect_result, Err(ref err) if should_retry_with_password(&connect_config.auth, err))
+    {
+        match prompt_password_auth_from_tui(&connect_config.username, &connect_config.hostname) {
+            Ok(auth) => {
+                connect_config.auth = auth;
+                connect_result = connect_session_for_host(app, config, host, &connect_config).await;
+            }
+            Err(err) => {
+                let reason = format!("Password prompt failed: {}", err);
+                if let Some(session) = app.session_manager.sessions.get_mut(idx) {
+                    session.state = SessionState::Disconnected {
+                        reason: reason.clone(),
+                    };
+                }
+                app.set_status(reason);
+                return Ok(());
+            }
+        }
+    }
 
     // Connect (directly or via jump host)
     match connect_result {
@@ -3119,5 +3189,45 @@ mod tests {
         let target = config.hosts.iter().find(|h| h.name == "web").unwrap();
         let jump_name = target.jump_host.as_deref().filter(|j| !j.is_empty());
         assert_eq!(jump_name, None);
+    }
+
+    #[test]
+    fn test_configured_auth_method_prefers_host_key_default_key_then_agent() {
+        let host_key = configured_auth_method(Some("~/host_key"), Some("~/default_key"), true)
+            .expect("host key auth");
+        assert!(matches!(host_key, AuthMethod::KeyFile(_)));
+
+        let default_key =
+            configured_auth_method(None, Some("~/default_key"), true).expect("default key auth");
+        match default_key {
+            AuthMethod::KeyFile(path) => {
+                assert!(path.to_string_lossy().contains("default_key"));
+            }
+            _ => panic!("expected key file auth"),
+        }
+
+        let agent = configured_auth_method(None, None, true).expect("agent auth");
+        assert!(matches!(agent, AuthMethod::Agent));
+    }
+
+    #[test]
+    fn test_configured_auth_method_returns_none_without_key_or_agent() {
+        assert!(configured_auth_method(None, None, false).is_none());
+    }
+
+    #[test]
+    fn test_should_retry_with_password_only_for_non_password_auth_failures() {
+        assert!(should_retry_with_password(
+            &AuthMethod::Agent,
+            &SshError::Auth("Authentication failed".to_string())
+        ));
+        assert!(!should_retry_with_password(
+            &AuthMethod::Password("secret".to_string()),
+            &SshError::Auth("Authentication failed".to_string())
+        ));
+        assert!(!should_retry_with_password(
+            &AuthMethod::Agent,
+            &SshError::HostKey("mismatch".to_string())
+        ));
     }
 }
