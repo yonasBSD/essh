@@ -289,7 +289,7 @@ fn render_processes(
         .map(|p| {
             Row::new(vec![
                 Cell::from(format!(" {}", p.pid)),
-                Cell::from(p.name.chars().take(30).collect::<String>()),
+                Cell::from(p.name.as_str()),
                 Cell::from(format!("{:.1}", p.cpu_pct))
                     .style(Style::default().fg(widgets::pct_color(p.cpu_pct))),
                 Cell::from(format!("{:.1}", p.mem_pct))
