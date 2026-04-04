@@ -1,3 +1,4 @@
+use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -53,11 +54,28 @@ impl ConnectConfig {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum AuthMethod {
     Password(String),
-    KeyFile(PathBuf),
+    KeyFile {
+        path: PathBuf,
+        passphrase: Option<String>,
+    },
     Agent,
+}
+
+impl fmt::Debug for AuthMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AuthMethod::Password(_) => f.write_str("Password([redacted])"),
+            AuthMethod::KeyFile { path, passphrase } => f
+                .debug_struct("KeyFile")
+                .field("path", path)
+                .field("encrypted", &passphrase.is_some())
+                .finish(),
+            AuthMethod::Agent => f.write_str("Agent"),
+        }
+    }
 }
 
 pub struct ClientHandler {
@@ -142,8 +160,8 @@ impl SshClient {
                     .map_err(SshError::Russh)?;
                 result.success()
             }
-            AuthMethod::KeyFile(path) => {
-                let key = russh::keys::load_secret_key(path, None)?;
+            AuthMethod::KeyFile { path, passphrase } => {
+                let key = russh::keys::load_secret_key(path, passphrase.as_deref())?;
                 let key = PrivateKeyWithHashAlg::new(Arc::new(key), None);
                 let result = handle
                     .authenticate_publickey(&config.username, key)
@@ -287,8 +305,8 @@ impl SshClient {
                 .await
                 .map_err(SshError::Russh)?
                 .success(),
-            AuthMethod::KeyFile(path) => {
-                let key = russh::keys::load_secret_key(path, None)?;
+            AuthMethod::KeyFile { path, passphrase } => {
+                let key = russh::keys::load_secret_key(path, passphrase.as_deref())?;
                 let key = PrivateKeyWithHashAlg::new(Arc::new(key), None);
                 handle
                     .authenticate_publickey(&target_config.username, key)
@@ -504,8 +522,11 @@ mod tests {
         let pw = AuthMethod::Password("secret".to_string());
         assert!(matches!(pw, AuthMethod::Password(_)));
 
-        let key = AuthMethod::KeyFile("/home/user/.ssh/id_ed25519".into());
-        assert!(matches!(key, AuthMethod::KeyFile(_)));
+        let key = AuthMethod::KeyFile {
+            path: "/home/user/.ssh/id_ed25519".into(),
+            passphrase: None,
+        };
+        assert!(matches!(key, AuthMethod::KeyFile { .. }));
 
         let agent = AuthMethod::Agent;
         assert!(matches!(agent, AuthMethod::Agent));

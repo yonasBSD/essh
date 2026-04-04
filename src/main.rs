@@ -15,6 +15,7 @@ mod ssh;
 mod tui;
 
 use std::io::{self, Read as _, Write as _};
+use std::path::Path;
 use std::time::Duration;
 
 use clap::Parser;
@@ -116,19 +117,22 @@ async fn run_command(cmd: Commands, config: AppConfig) -> anyhow::Result<()> {
         } => {
             let (user, host) = parse_target(&target, &config);
             let auth = if password {
-                let pw = prompt_password(&format!("{}@{}'s password: ", user, host))?;
-                AuthMethod::Password(pw)
+                prompt_password_auth(&user, &host)?
             } else if let Some(key_path) = identity {
-                AuthMethod::KeyFile(key_path)
-            } else if let Some(ref default_key) = config.general.default_key {
-                let expanded = shellexpand::tilde(default_key).to_string();
-                AuthMethod::KeyFile(expanded.into())
-            } else if std::env::var("SSH_AUTH_SOCK").is_ok() {
-                AuthMethod::Agent
+                AuthMethod::KeyFile {
+                    path: key_path,
+                    passphrase: None,
+                }
+            } else if let Some(auth) = configured_auth_method(
+                None,
+                config.general.default_key.as_deref(),
+                ssh_agent_available(),
+            )? {
+                auth
             } else {
-                let pw = prompt_password(&format!("{}@{}'s password: ", user, host))?;
-                AuthMethod::Password(pw)
+                prompt_password_auth(&user, &host)?
             };
+            let auth = resolve_key_auth_method(auth, prompt_key_passphrase)?;
 
             let connect_config = ConnectConfig {
                 hostname: host.clone(),
@@ -246,7 +250,18 @@ async fn run_command(cmd: Commands, config: AppConfig) -> anyhow::Result<()> {
                         .to_string_lossy()
                         .to_string()
                 });
-                let key = russh_keys::load_secret_key(&path, None)?;
+                let auth = resolve_key_auth_method(
+                    AuthMethod::KeyFile {
+                        path: path.clone(),
+                        passphrase: None,
+                    },
+                    prompt_key_passphrase,
+                )?;
+                let passphrase = match auth {
+                    AuthMethod::KeyFile { passphrase, .. } => passphrase,
+                    _ => unreachable!("key auth resolution must return a keyfile"),
+                };
+                let key = russh_keys::load_secret_key(&path, passphrase.as_deref())?;
                 let key_type = format!("{:?}", key);
                 let key_type_short = key_type.split('(').next().unwrap_or("unknown").to_string();
                 db.add_key(
@@ -1792,17 +1807,78 @@ fn configured_auth_method(
     host_key: Option<&str>,
     default_key: Option<&str>,
     has_ssh_agent: bool,
-) -> Option<AuthMethod> {
+) -> anyhow::Result<Option<AuthMethod>> {
     if let Some(key) = host_key {
         let expanded = shellexpand::tilde(key).to_string();
-        Some(AuthMethod::KeyFile(expanded.into()))
+        Ok(Some(AuthMethod::KeyFile {
+            path: expanded.into(),
+            passphrase: None,
+        }))
     } else if let Some(key) = default_key {
         let expanded = shellexpand::tilde(key).to_string();
-        Some(AuthMethod::KeyFile(expanded.into()))
+        Ok(Some(AuthMethod::KeyFile {
+            path: expanded.into(),
+            passphrase: None,
+        }))
     } else if has_ssh_agent {
-        Some(AuthMethod::Agent)
+        Ok(Some(AuthMethod::Agent))
     } else {
-        None
+        Ok(None)
+    }
+}
+
+fn is_encrypted_key_error(err: &russh::keys::Error) -> bool {
+    matches!(err, russh::keys::Error::KeyIsEncrypted)
+}
+
+fn prompt_key_passphrase(path: &Path) -> anyhow::Result<String> {
+    prompt_password(&format!("Passphrase for {}: ", path.display()))
+}
+
+fn prompt_secret_from_tui(prompt: &str) -> anyhow::Result<String> {
+    let _restore_tui = scopeguard::guard((), |_| {
+        io::stdout().execute(EnterAlternateScreen).ok();
+        terminal::enable_raw_mode().ok();
+    });
+
+    terminal::disable_raw_mode()?;
+    io::stdout().execute(LeaveAlternateScreen)?;
+
+    prompt_password(prompt)
+}
+
+fn prompt_key_passphrase_from_tui(path: &Path) -> anyhow::Result<String> {
+    prompt_secret_from_tui(&format!("Passphrase for {}: ", path.display()))
+}
+
+fn resolve_key_auth_method<F>(
+    auth: AuthMethod,
+    prompt_passphrase: F,
+) -> Result<AuthMethod, SshError>
+where
+    F: FnOnce(&Path) -> anyhow::Result<String>,
+{
+    match auth {
+        AuthMethod::KeyFile {
+            path,
+            passphrase: None,
+        } => match russh::keys::load_secret_key(&path, None) {
+            Ok(_) => Ok(AuthMethod::KeyFile {
+                path,
+                passphrase: None,
+            }),
+            Err(err) if is_encrypted_key_error(&err) => {
+                let passphrase = prompt_passphrase(&path)
+                    .map_err(|e| SshError::Auth(format!("Failed to read key passphrase: {}", e)))?;
+                russh::keys::load_secret_key(&path, Some(&passphrase)).map_err(SshError::Key)?;
+                Ok(AuthMethod::KeyFile {
+                    path,
+                    passphrase: Some(passphrase),
+                })
+            }
+            Err(err) => Err(SshError::Key(err)),
+        },
+        _ => Ok(auth),
     }
 }
 
@@ -1813,15 +1889,9 @@ fn prompt_password_auth(username: &str, hostname: &str) -> anyhow::Result<AuthMe
 }
 
 fn prompt_password_auth_from_tui(username: &str, hostname: &str) -> anyhow::Result<AuthMethod> {
-    let _restore_tui = scopeguard::guard((), |_| {
-        io::stdout().execute(EnterAlternateScreen).ok();
-        terminal::enable_raw_mode().ok();
-    });
-
-    terminal::disable_raw_mode()?;
-    io::stdout().execute(LeaveAlternateScreen)?;
-
-    prompt_password_auth(username, hostname)
+    let prompt = format!("{}@{}'s password: ", username, hostname);
+    let password = prompt_secret_from_tui(&prompt)?;
+    Ok(AuthMethod::Password(password))
 }
 
 fn should_retry_with_password(auth: &AuthMethod, err: &SshError) -> bool {
@@ -1857,8 +1927,12 @@ async fn connect_session_for_host(
             .unwrap_or_else(whoami);
         let jump_auth = jump_entry
             .and_then(|e| e.key.as_ref())
-            .map(|k| AuthMethod::KeyFile(shellexpand::tilde(k).to_string().into()))
+            .map(|k| AuthMethod::KeyFile {
+                path: shellexpand::tilde(k).to_string().into(),
+                passphrase: None,
+            })
             .unwrap_or_else(|| connect_config.auth.clone());
+        let jump_auth = resolve_key_auth_method(jump_auth, prompt_key_passphrase_from_tui)?;
 
         let jump_config = ConnectConfig {
             hostname: jump_hostname,
@@ -1905,7 +1979,7 @@ async fn open_session(
         host_entry.and_then(|entry| entry.key.as_deref()),
         config.general.default_key.as_deref(),
         ssh_agent_available(),
-    ) {
+    )? {
         Some(auth) => auth,
         None => match prompt_password_auth_from_tui(&user, &host.hostname) {
             Ok(auth) => auth,
@@ -1914,6 +1988,13 @@ async fn open_session(
                 return Ok(());
             }
         },
+    };
+    let auth = match resolve_key_auth_method(auth, prompt_key_passphrase_from_tui) {
+        Ok(auth) => auth,
+        Err(err) => {
+            app.set_status(format!("Key auth setup failed: {}", err));
+            return Ok(());
+        }
     };
 
     let mut connect_config = ConnectConfig {
@@ -2865,12 +2946,16 @@ async fn run_on_group(
         .or(config.general.default_key.as_ref())
     {
         let expanded = shellexpand::tilde(key).to_string();
-        AuthMethod::KeyFile(expanded.into())
+        AuthMethod::KeyFile {
+            path: expanded.into(),
+            passphrase: None,
+        }
     } else if std::env::var("SSH_AUTH_SOCK").is_ok() {
         AuthMethod::Agent
     } else {
         anyhow::bail!("No key configured for group and no ssh-agent available.");
     };
+    let auth = resolve_key_auth_method(auth, prompt_key_passphrase)?;
 
     let mut handles = Vec::new();
     for host in hosts {
@@ -3051,6 +3136,28 @@ async fn download_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ssh_key::rand_core::OsRng;
+    use ssh_key::{Algorithm, LineEnding, PrivateKey};
+    use tempfile::NamedTempFile;
+
+    fn write_test_key(encrypted: bool) -> NamedTempFile {
+        let file = NamedTempFile::new().expect("create temp key file");
+        let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).expect("generate test key");
+        let key = if encrypted {
+            key.encrypt(&mut OsRng, "hunter2")
+                .expect("encrypt test key")
+        } else {
+            key
+        };
+        std::fs::write(
+            file.path(),
+            key.to_openssh(LineEnding::LF)
+                .expect("encode openssh key")
+                .as_bytes(),
+        )
+        .expect("write test key");
+        file
+    }
 
     #[test]
     fn test_reconnect_tracker_initial_state() {
@@ -3194,25 +3301,70 @@ mod tests {
     #[test]
     fn test_configured_auth_method_prefers_host_key_default_key_then_agent() {
         let host_key = configured_auth_method(Some("~/host_key"), Some("~/default_key"), true)
-            .expect("host key auth");
-        assert!(matches!(host_key, AuthMethod::KeyFile(_)));
+            .expect("host key auth")
+            .expect("host key auth method");
+        assert!(matches!(host_key, AuthMethod::KeyFile { .. }));
 
-        let default_key =
-            configured_auth_method(None, Some("~/default_key"), true).expect("default key auth");
+        let default_key = configured_auth_method(None, Some("~/default_key"), true)
+            .expect("default key auth")
+            .expect("default key auth method");
         match default_key {
-            AuthMethod::KeyFile(path) => {
+            AuthMethod::KeyFile { path, passphrase } => {
                 assert!(path.to_string_lossy().contains("default_key"));
+                assert!(passphrase.is_none());
             }
             _ => panic!("expected key file auth"),
         }
 
-        let agent = configured_auth_method(None, None, true).expect("agent auth");
+        let agent = configured_auth_method(None, None, true)
+            .expect("agent auth")
+            .expect("agent auth method");
         assert!(matches!(agent, AuthMethod::Agent));
     }
 
     #[test]
     fn test_configured_auth_method_returns_none_without_key_or_agent() {
-        assert!(configured_auth_method(None, None, false).is_none());
+        assert!(configured_auth_method(None, None, false)
+            .expect("missing auth")
+            .is_none());
+    }
+
+    #[test]
+    fn test_resolve_key_auth_method_keeps_plain_key_unprompted() {
+        let key_file = write_test_key(false);
+        let auth = resolve_key_auth_method(
+            AuthMethod::KeyFile {
+                path: key_file.path().to_path_buf(),
+                passphrase: None,
+            },
+            |_| panic!("plain key should not prompt"),
+        )
+        .expect("resolve plain key auth");
+
+        match auth {
+            AuthMethod::KeyFile { passphrase, .. } => assert!(passphrase.is_none()),
+            _ => panic!("expected key auth"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_key_auth_method_prompts_for_encrypted_key() {
+        let key_file = write_test_key(true);
+        let auth = resolve_key_auth_method(
+            AuthMethod::KeyFile {
+                path: key_file.path().to_path_buf(),
+                passphrase: None,
+            },
+            |_| Ok("hunter2".to_string()),
+        )
+        .expect("resolve encrypted key auth");
+
+        match auth {
+            AuthMethod::KeyFile { passphrase, .. } => {
+                assert_eq!(passphrase.as_deref(), Some("hunter2"));
+            }
+            _ => panic!("expected key auth"),
+        }
     }
 
     #[test]
