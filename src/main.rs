@@ -16,8 +16,9 @@ mod theme;
 mod tui;
 
 use std::io::{self, Read as _, Write as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+use std::{collections::HashSet, process::Command};
 
 use clap::Parser;
 use crossterm::{
@@ -62,6 +63,15 @@ struct ReconnectTracker {
     last_attempt: std::time::Instant,
     backoff_secs: u64,
 }
+
+struct TuiState {
+    reconnect_trackers: Vec<Option<ReconnectTracker>>,
+    notification_matcher: NotificationMatcher,
+    fleet_prober: fleet::FleetProber,
+    fleet_probe_task: Option<FleetProbeTask>,
+}
+
+type FleetProbeTask = tokio::task::JoinHandle<Vec<(String, u16, fleet::ProbeResult)>>;
 
 impl ReconnectTracker {
     fn new(max_retries: u32) -> Self {
@@ -117,32 +127,55 @@ async fn run_command(cmd: Commands, config: AppConfig) -> anyhow::Result<()> {
             password,
         } => {
             let (user, host) = parse_target(&target, &config);
-            let auth = if password {
-                prompt_password_auth(&user, &host)?
+            let used_identity = identity.is_some();
+            let mut auth_candidates = if password {
+                vec![prompt_password_auth(&user, &host)?]
             } else if let Some(key_path) = identity {
-                AuthMethod::KeyFile {
+                vec![AuthMethod::KeyFile {
                     path: key_path,
                     passphrase: None,
-                }
-            } else if let Some(auth) = configured_auth_method(
-                None,
-                config.general.default_key.as_deref(),
-                ssh_agent_available(),
-            )? {
-                auth
+                }]
             } else {
-                prompt_password_auth(&user, &host)?
+                configured_auth_methods(
+                    None,
+                    config.general.default_key.as_deref(),
+                    ssh_agent_available(),
+                )?
             };
-            let auth = resolve_key_auth_method(auth, prompt_key_passphrase)?;
 
-            let connect_config = ConnectConfig {
-                hostname: host.clone(),
+            if auth_candidates.is_empty() {
+                auth_candidates.push(prompt_password_auth(&user, &host)?);
+            }
+
+            match connect_and_shell_with_auth_candidates(
+                host.clone(),
                 port,
-                username: user.clone(),
-                auth,
-            };
+                user.clone(),
+                auth_candidates,
+                &config,
+                &audit,
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(err)
+                    if !password
+                        && !used_identity
+                        && err
+                            .downcast_ref::<SshError>()
+                            .is_some_and(should_try_next_auth_candidate) =>
+                {
+                    let connect_config = ConnectConfig {
+                        hostname: host.clone(),
+                        port,
+                        username: user.clone(),
+                        auth: prompt_password_auth(&user, &host)?,
+                    };
 
-            connect_and_shell(connect_config, &config, &audit).await?;
+                    connect_and_shell(connect_config, &config, &audit).await?;
+                }
+                Err(err) => return Err(err),
+            }
         }
 
         Commands::Hosts { action } => match action {
@@ -520,6 +553,48 @@ async fn connect_and_shell(
     Ok(())
 }
 
+async fn connect_and_shell_with_auth_candidates(
+    hostname: String,
+    port: u16,
+    username: String,
+    auth_candidates: Vec<AuthMethod>,
+    app_config: &AppConfig,
+    audit: &AuditLogger,
+) -> anyhow::Result<()> {
+    let mut last_auth_error = None;
+
+    for auth in auth_candidates {
+        let auth = match resolve_key_auth_method(auth, prompt_key_passphrase) {
+            Ok(auth) => auth,
+            Err(err) if should_try_next_auth_candidate(&err) => {
+                last_auth_error = Some(anyhow::Error::new(err));
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
+        let connect_config = ConnectConfig {
+            hostname: hostname.clone(),
+            port,
+            username: username.clone(),
+            auth,
+        };
+
+        match connect_and_shell(connect_config, app_config, audit).await {
+            Ok(()) => return Ok(()),
+            Err(err)
+                if err
+                    .downcast_ref::<SshError>()
+                    .is_some_and(should_try_next_auth_candidate) =>
+            {
+                last_auth_error = Some(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(last_auth_error.unwrap_or_else(|| anyhow::anyhow!("No authentication methods available")))
+}
+
 async fn run_interactive_shell(
     mut channel: russh::Channel<russh::client::Msg>,
     diag: DiagnosticsEngine,
@@ -654,18 +729,16 @@ async fn tui_main_loop(
     // Tick counter for periodic monitor collection
     let mut tick_count: u64 = 0;
 
-    // Per-session reconnect trackers (indexed same as sessions)
-    let mut reconnect_trackers: Vec<Option<ReconnectTracker>> = Vec::new();
-
-    // Notification matcher for background session output
-    let notification_matcher = NotificationMatcher::new(&config.session.notification_patterns);
-
-    // Fleet health prober
-    let mut fleet_prober = fleet::FleetProber::new(
-        config.fleet.probe_interval,
-        config.fleet.probe_timeout,
-        config.fleet.latency_history_samples,
-    );
+    let mut tui_state = TuiState {
+        reconnect_trackers: Vec::new(),
+        notification_matcher: NotificationMatcher::new(&config.session.notification_patterns),
+        fleet_prober: fleet::FleetProber::new(
+            config.fleet.probe_interval,
+            config.fleet.probe_timeout,
+            config.fleet.latency_history_samples,
+        ),
+        fleet_probe_task: None,
+    };
 
     loop {
         // Draw
@@ -683,9 +756,11 @@ async fn tui_main_loop(
                                 session.terminal.process(&data);
                                 if app.session_manager.active_index != Some(i) {
                                     session.has_new_output = true;
-                                    if !notification_matcher.is_empty() {
+                                    if !tui_state.notification_matcher.is_empty() {
                                         let text = String::from_utf8_lossy(&data);
-                                        if let Some(matched) = notification_matcher.check(&text) {
+                                        if let Some(matched) =
+                                            tui_state.notification_matcher.check(&text)
+                                        {
                                             app.notifications.push(Notification {
                                                 session_label: session.label.clone(),
                                                 matched_text: matched,
@@ -711,10 +786,11 @@ async fn tui_main_loop(
                                             session.state =
                                                 SessionState::Reconnecting { attempt: 1, max };
                                         }
-                                        while reconnect_trackers.len() <= i {
-                                            reconnect_trackers.push(None);
+                                        while tui_state.reconnect_trackers.len() <= i {
+                                            tui_state.reconnect_trackers.push(None);
                                         }
-                                        reconnect_trackers[i] = Some(ReconnectTracker::new(max));
+                                        tui_state.reconnect_trackers[i] =
+                                            Some(ReconnectTracker::new(max));
                                     } else if let Some(session) =
                                         app.session_manager.sessions.get_mut(i)
                                     {
@@ -741,10 +817,13 @@ async fn tui_main_loop(
                     &audit,
                     &mut runtimes,
                     &mut session_output_rxs,
-                    &mut reconnect_trackers,
+                    &mut tui_state,
                 )
                 .await?;
                 if handled == KeyAction::Quit {
+                    if let Some(task) = tui_state.fleet_probe_task.take() {
+                        task.abort();
+                    }
                     // Close all sessions
                     for rt in runtimes.iter_mut().flatten() {
                         rt.ssh_session.close().await.ok();
@@ -754,6 +833,30 @@ async fn tui_main_loop(
             }
             AppEvent::Tick => {
                 tick_count += 1;
+
+                if let Some(task) = tui_state.fleet_probe_task.take() {
+                    if task.is_finished() {
+                        if let Ok(results) = task.await {
+                            tui_state.fleet_prober.record_probe_results(results);
+                            for host in app.hosts.iter_mut() {
+                                if let Some(state) =
+                                    tui_state.fleet_prober.get_state(&host.hostname, host.port)
+                                {
+                                    if state.result.online {
+                                        host.status = HostStatus::Online;
+                                        host.latency_ms = state.result.latency_ms;
+                                    } else {
+                                        host.status = HostStatus::Offline;
+                                        host.latency_ms = None;
+                                    }
+                                    host.latency_history = state.latency_history.clone();
+                                }
+                            }
+                        }
+                    } else {
+                        tui_state.fleet_probe_task = Some(task);
+                    }
+                }
 
                 // Update diagnostics snapshots every 10 ticks (1s)
                 if tick_count.is_multiple_of(10) {
@@ -768,21 +871,21 @@ async fn tui_main_loop(
                 }
 
                 // Collect host metrics every 20 ticks (2s)
-                if tick_count.is_multiple_of(20) {
-                    for (i, rt_opt) in runtimes.iter().enumerate() {
-                        if let Some(rt) = rt_opt {
+                if tick_count.is_multiple_of(20)
+                    && (app.view == AppView::Monitor
+                        || (app.view == AppView::Session && app.split_pane))
+                {
+                    if let Some(i) = app.session_manager.active_index {
+                        if let Some(Some(rt)) = runtimes.get(i) {
                             if let Some(ref mon) = rt.monitor {
                                 let handle = &rt.ssh_session.handle;
-                                // Non-blocking: spawn collection as a task
                                 let metrics_arc = mon.metrics();
                                 let cpu_h = mon.cpu_history();
                                 let mem_h = mon.mem_history();
                                 let rx_h = mon.net_rx_history();
                                 let tx_h = mon.net_tx_history();
-                                // We do a quick clone of handle for the spawned task
-                                // Actually we can't easily clone Handle, so collect inline
                                 let _ = mon.collect(handle).await;
-                                // Update app state from collector
+
                                 if let Some(slot) = app.session_metrics.get_mut(i) {
                                     *slot = Some(metrics_arc.read().await.clone());
                                 }
@@ -813,7 +916,10 @@ async fn tui_main_loop(
                         continue;
                     }
 
-                    let tracker = reconnect_trackers.get_mut(i).and_then(|t| t.as_mut());
+                    let tracker = tui_state
+                        .reconnect_trackers
+                        .get_mut(i)
+                        .and_then(|t| t.as_mut());
                     let tracker = match tracker {
                         Some(t) => t,
                         None => continue,
@@ -825,7 +931,7 @@ async fn tui_main_loop(
                                 reason: "Reconnect failed (max retries)".to_string(),
                             };
                         }
-                        reconnect_trackers[i] = None;
+                        tui_state.reconnect_trackers[i] = None;
                         continue;
                     }
 
@@ -865,7 +971,7 @@ async fn tui_main_loop(
                             if let Some(session) = app.session_manager.sessions.get_mut(i) {
                                 session.state = SessionState::Active;
                             }
-                            reconnect_trackers[i] = None;
+                            tui_state.reconnect_trackers[i] = None;
                             app.set_status(format!("Reconnected to {}", connect_config.hostname));
                         }
                         Err(_) => {
@@ -875,27 +981,21 @@ async fn tui_main_loop(
                 }
 
                 // Fleet health probes
-                if config.fleet.probe_enabled && fleet_prober.should_probe() {
+                if config.fleet.probe_enabled
+                    && tui_state.fleet_probe_task.is_none()
+                    && tui_state.fleet_prober.should_probe()
+                {
                     let hosts: Vec<(String, u16)> = app
                         .hosts
                         .iter()
                         .map(|h| (h.hostname.clone(), h.port))
                         .collect();
                     if !hosts.is_empty() {
-                        fleet_prober.probe_all(&hosts).await;
-                        // Update host displays with probe results
-                        for host in app.hosts.iter_mut() {
-                            if let Some(state) = fleet_prober.get_state(&host.hostname, host.port) {
-                                if state.result.online {
-                                    host.status = HostStatus::Online;
-                                    host.latency_ms = state.result.latency_ms;
-                                } else {
-                                    host.status = HostStatus::Offline;
-                                    host.latency_ms = None;
-                                }
-                                host.latency_history = state.latency_history.clone();
-                            }
-                        }
+                        let timeout = tui_state.fleet_prober.probe_timeout();
+                        tui_state.fleet_prober.mark_probe_started();
+                        tui_state.fleet_probe_task = Some(tokio::spawn(async move {
+                            fleet::FleetProber::probe_hosts(hosts, timeout).await
+                        }));
                     }
                 }
             }
@@ -928,8 +1028,71 @@ async fn handle_key_event(
     audit: &AuditLogger,
     runtimes: &mut Vec<Option<SessionRuntime>>,
     output_rxs: &mut Vec<Option<tokio::sync::mpsc::Receiver<Vec<u8>>>>,
-    reconnect_trackers: &mut Vec<Option<ReconnectTracker>>,
+    tui_state: &mut TuiState,
 ) -> anyhow::Result<KeyAction> {
+    if app.add_host_active {
+        match key.code {
+            KeyCode::Esc => {
+                app.add_host_active = false;
+                app.add_host_input.clear();
+                app.add_host_error = None;
+                app.add_host_original = None;
+                app.set_status("Add host cancelled.".to_string());
+            }
+            KeyCode::Enter => {
+                let input = app.add_host_input.trim().to_string();
+                if input.is_empty() {
+                    app.add_host_active = false;
+                    app.add_host_input.clear();
+                    app.add_host_error = None;
+                    app.add_host_original = None;
+                    app.set_status("Add host cancelled.".to_string());
+                } else {
+                    match parse_dashboard_host_input(&input) {
+                        Ok(entry) => {
+                            let save = save_host_dialog_entry(
+                                config,
+                                app.add_host_original
+                                    .as_ref()
+                                    .map(|(host, port)| (host.as_str(), *port)),
+                                entry,
+                            );
+                            config.save()?;
+                            load_hosts_into_app(app, config)?;
+                            app.dashboard_tab = DashboardTab::Hosts;
+                            select_host(app, &save.hostname, save.port);
+                            app.add_host_active = false;
+                            app.add_host_input.clear();
+                            app.add_host_error = None;
+                            app.add_host_original = None;
+                            app.set_status(format!(
+                                "{} {}:{}",
+                                save.verb, save.hostname, save.port
+                            ));
+                        }
+                        Err(err) => {
+                            app.add_host_error = Some(err.clone());
+                            app.set_status(format!("Add host failed: {}", err));
+                        }
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                app.add_host_input.pop();
+                app.add_host_error = None;
+            }
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !has_meta_modifier(key.modifiers) =>
+            {
+                app.add_host_input.push(c);
+                app.add_host_error = None;
+            }
+            _ => {}
+        }
+        return Ok(KeyAction::Handled);
+    }
+
     // Command palette — intercept before everything else
     if app.command_palette.is_some() {
         return handle_palette_key(key, app, config, audit, runtimes, output_rxs).await;
@@ -956,7 +1119,7 @@ async fn handle_key_event(
         }
         return Ok(KeyAction::Handled);
     }
-    if key.code == KeyCode::Char('?') && !key.modifiers.contains(KeyModifiers::ALT) {
+    if key.code == KeyCode::Char('?') && !has_meta_modifier(key.modifiers) {
         // Don't intercept '?' when in an active session (it should go to remote shell)
         if app.view != AppView::Session {
             app.show_help = true;
@@ -964,23 +1127,33 @@ async fn handle_key_event(
         }
     }
 
-    let is_alt = key.modifiers.contains(KeyModifiers::ALT);
+    if let Some(idx) = plain_option_symbol_session_switch_index(&key.code) {
+        if app.session_manager.switch_to(idx) {
+            if let Some(session) = app.session_manager.sessions.get(idx) {
+                let label = session.label.clone();
+                app.notifications.retain(|n| n.session_label != label);
+            }
+            app.view = AppView::Session;
+        }
+        return Ok(KeyAction::Handled);
+    }
+
+    let is_alt = has_meta_modifier(key.modifiers);
 
     // Global keybindings (work in all views)
     if is_alt {
-        match key.code {
-            // Alt+1 through Alt+9: switch to session
-            KeyCode::Char(c @ '1'..='9') => {
-                let idx = (c as usize) - ('1' as usize);
-                if app.session_manager.switch_to(idx) {
-                    if let Some(session) = app.session_manager.sessions.get(idx) {
-                        let label = session.label.clone();
-                        app.notifications.retain(|n| n.session_label != label);
-                    }
-                    app.view = AppView::Session;
+        if let Some(idx) = alt_session_switch_index(&key.code) {
+            if app.session_manager.switch_to(idx) {
+                if let Some(session) = app.session_manager.sessions.get(idx) {
+                    let label = session.label.clone();
+                    app.notifications.retain(|n| n.session_label != label);
                 }
-                return Ok(KeyAction::Handled);
+                app.view = AppView::Session;
             }
+            return Ok(KeyAction::Handled);
+        }
+
+        match key.code {
             // Alt+Left: previous session
             KeyCode::Left => {
                 app.session_manager.switch_prev();
@@ -1127,8 +1300,8 @@ async fn handle_key_event(
                     if idx < output_rxs.len() {
                         output_rxs.remove(idx);
                     }
-                    if idx < reconnect_trackers.len() {
-                        reconnect_trackers.remove(idx);
+                    if idx < tui_state.reconnect_trackers.len() {
+                        tui_state.reconnect_trackers.remove(idx);
                     }
                     app.session_manager.remove_session(idx);
                     app.remove_session_tracking(idx);
@@ -1216,7 +1389,7 @@ async fn handle_key_event(
     // View-specific keybindings
     match app.view {
         AppView::Dashboard => {
-            handle_dashboard_key(key, app, config, audit, runtimes, output_rxs).await
+            handle_dashboard_key(key, app, config, audit, runtimes, output_rxs, tui_state).await
         }
         AppView::Session => handle_session_key(key, app, runtimes).await,
         AppView::Monitor => handle_monitor_key(key, app, config),
@@ -1710,6 +1883,7 @@ async fn handle_dashboard_key(
     audit: &AuditLogger,
     runtimes: &mut Vec<Option<SessionRuntime>>,
     output_rxs: &mut Vec<Option<tokio::sync::mpsc::Receiver<Vec<u8>>>>,
+    tui_state: &mut TuiState,
 ) -> anyhow::Result<KeyAction> {
     // Search mode input handling
     if app.search_active {
@@ -1754,6 +1928,31 @@ async fn handle_dashboard_key(
             app.search_active = true;
             app.search_query.clear();
         }
+        KeyCode::Char('e') if app.dashboard_tab == DashboardTab::Config => {
+            match edit_config_from_tui(config) {
+                Ok(()) => {
+                    reload_app_config_state(app, config, tui_state)?;
+                    app.set_status("Config reloaded.".to_string());
+                }
+                Err(err) => app.set_status(format!("Config edit failed: {}", err)),
+            }
+        }
+        KeyCode::Char('a') => {
+            app.add_host_active = true;
+            app.add_host_input.clear();
+            app.add_host_error = None;
+            app.add_host_original = None;
+        }
+        KeyCode::Char('e') if app.dashboard_tab == DashboardTab::Hosts => {
+            if let Some(host) = app.selected_host().cloned() {
+                app.add_host_active = true;
+                app.add_host_input = format_host_dialog_input(&host);
+                app.add_host_error = None;
+                app.add_host_original = Some((host.hostname.clone(), host.port));
+            } else {
+                app.set_status("No host selected to edit.".to_string());
+            }
+        }
         KeyCode::Char('t') => cycle_theme(app, config),
         KeyCode::Char('r') => {
             load_hosts_into_app(app, config)?;
@@ -1761,10 +1960,25 @@ async fn handle_dashboard_key(
         }
         KeyCode::Char('d') => {
             if let Some(host) = app.selected_host().cloned() {
-                let db = CacheDb::open_default()?;
-                db.remove_host(&host.hostname, host.port)?;
-                load_hosts_into_app(app, config)?;
-                app.set_status(format!("Removed {}.", host.hostname));
+                let removed_from_config = remove_config_host(config, &host.hostname, host.port);
+                if removed_from_config {
+                    config.save()?;
+                }
+
+                let removed_from_cache = match CacheDb::open_default() {
+                    Ok(db) => db.remove_host(&host.hostname, host.port)?,
+                    Err(_) => false,
+                };
+
+                if removed_from_config || removed_from_cache {
+                    load_hosts_into_app(app, config)?;
+                    app.set_status(format!("Removed {}:{}.", host.hostname, host.port));
+                } else {
+                    app.set_status(format!(
+                        "Host {}:{} was not found.",
+                        host.hostname, host.port
+                    ));
+                }
             }
         }
         KeyCode::Enter => {
@@ -1784,7 +1998,9 @@ async fn handle_session_key(
     runtimes: &mut [Option<SessionRuntime>],
 ) -> anyhow::Result<KeyAction> {
     // In session view, forward all non-Alt keys to the remote shell
-    if key.modifiers.contains(KeyModifiers::ALT) {
+    if has_meta_modifier(key.modifiers)
+        || plain_option_symbol_session_switch_index(&key.code).is_some()
+    {
         return Ok(KeyAction::Handled); // already handled in global
     }
 
@@ -1831,6 +2047,40 @@ fn handle_monitor_key(
     Ok(KeyAction::Handled)
 }
 
+fn has_meta_modifier(modifiers: KeyModifiers) -> bool {
+    modifiers.intersects(KeyModifiers::ALT | KeyModifiers::META)
+}
+
+fn plain_option_symbol_session_switch_index(code: &KeyCode) -> Option<usize> {
+    match code {
+        KeyCode::Char('¡') => Some(0),
+        KeyCode::Char('™') => Some(1),
+        KeyCode::Char('£') => Some(2),
+        KeyCode::Char('¢') => Some(3),
+        KeyCode::Char('∞') => Some(4),
+        KeyCode::Char('§') => Some(5),
+        KeyCode::Char('¶') => Some(6),
+        KeyCode::Char('•') => Some(7),
+        KeyCode::Char('ª') => Some(8),
+        _ => None,
+    }
+}
+
+fn alt_session_switch_index(code: &KeyCode) -> Option<usize> {
+    match code {
+        KeyCode::Char('1' | '¡') => Some(0),
+        KeyCode::Char('2' | '™') => Some(1),
+        KeyCode::Char('3' | '£') => Some(2),
+        KeyCode::Char('4' | '¢') => Some(3),
+        KeyCode::Char('5' | '∞') => Some(4),
+        KeyCode::Char('6' | '§') => Some(5),
+        KeyCode::Char('7' | '¶') => Some(6),
+        KeyCode::Char('8' | '•') => Some(7),
+        KeyCode::Char('9' | 'ª') => Some(8),
+        _ => None,
+    }
+}
+
 fn cycle_theme(app: &mut App, config: &mut AppConfig) {
     let next = theme::next_theme_name(&config.theme).to_string();
     config.theme = next.clone();
@@ -1843,32 +2093,126 @@ fn cycle_theme(app: &mut App, config: &mut AppConfig) {
     }
 }
 
+fn reload_app_config_state(
+    app: &mut App,
+    config: &AppConfig,
+    tui_state: &mut TuiState,
+) -> anyhow::Result<()> {
+    app.theme = theme::by_name(&config.theme);
+    load_hosts_into_app(app, config)?;
+    tui_state.notification_matcher =
+        NotificationMatcher::new(&config.session.notification_patterns);
+    tui_state.fleet_prober = fleet::FleetProber::new(
+        config.fleet.probe_interval,
+        config.fleet.probe_timeout,
+        config.fleet.latency_history_samples,
+    );
+    Ok(())
+}
+
 fn ssh_agent_available() -> bool {
     std::env::var("SSH_AUTH_SOCK").is_ok()
 }
 
-fn configured_auth_method(
+fn configured_auth_methods(
     host_key: Option<&str>,
     default_key: Option<&str>,
     has_ssh_agent: bool,
-) -> anyhow::Result<Option<AuthMethod>> {
+) -> anyhow::Result<Vec<AuthMethod>> {
+    Ok(auth_candidates_from_paths(
+        host_key,
+        default_key,
+        &cached_key_paths(),
+        &default_ssh_key_paths(),
+        has_ssh_agent,
+    ))
+}
+
+fn auth_candidates_from_paths(
+    host_key: Option<&str>,
+    default_key: Option<&str>,
+    cached_key_paths: &[PathBuf],
+    standard_key_paths: &[PathBuf],
+    has_ssh_agent: bool,
+) -> Vec<AuthMethod> {
+    let mut methods = Vec::new();
+    let mut seen_paths = HashSet::new();
+
     if let Some(key) = host_key {
-        let expanded = shellexpand::tilde(key).to_string();
-        Ok(Some(AuthMethod::KeyFile {
-            path: expanded.into(),
-            passphrase: None,
-        }))
-    } else if let Some(key) = default_key {
-        let expanded = shellexpand::tilde(key).to_string();
-        Ok(Some(AuthMethod::KeyFile {
-            path: expanded.into(),
-            passphrase: None,
-        }))
-    } else if has_ssh_agent {
-        Ok(Some(AuthMethod::Agent))
-    } else {
-        Ok(None)
+        add_key_auth_candidate(
+            &mut methods,
+            &mut seen_paths,
+            PathBuf::from(shellexpand::tilde(key).to_string()),
+        );
     }
+
+    if let Some(key) = default_key {
+        add_key_auth_candidate(
+            &mut methods,
+            &mut seen_paths,
+            PathBuf::from(shellexpand::tilde(key).to_string()),
+        );
+    }
+
+    for path in cached_key_paths {
+        add_key_auth_candidate(&mut methods, &mut seen_paths, path.clone());
+    }
+
+    for path in standard_key_paths {
+        add_key_auth_candidate(&mut methods, &mut seen_paths, path.clone());
+    }
+
+    if has_ssh_agent {
+        methods.push(AuthMethod::Agent);
+    }
+
+    methods
+}
+
+fn add_key_auth_candidate(
+    methods: &mut Vec<AuthMethod>,
+    seen_paths: &mut HashSet<PathBuf>,
+    path: PathBuf,
+) {
+    if !path.exists() || !seen_paths.insert(path.clone()) {
+        return;
+    }
+
+    methods.push(AuthMethod::KeyFile {
+        path,
+        passphrase: None,
+    });
+}
+
+fn cached_key_paths() -> Vec<PathBuf> {
+    CacheDb::open_default()
+        .ok()
+        .and_then(|db| db.list_keys().ok())
+        .map(|keys| {
+            keys.into_iter()
+                .map(|key| PathBuf::from(key.path))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn default_ssh_key_paths() -> Vec<PathBuf> {
+    let Some(home_dir) = dirs::home_dir() else {
+        return Vec::new();
+    };
+
+    let ssh_dir = home_dir.join(".ssh");
+    [
+        "id_ed25519",
+        "id_rsa",
+        "id_ecdsa",
+        "id_dsa",
+        "id_ed25519_sk",
+        "id_ecdsa_sk",
+    ]
+    .into_iter()
+    .map(|name| ssh_dir.join(name))
+    .collect()
 }
 
 fn is_encrypted_key_error(err: &russh::keys::Error) -> bool {
@@ -1893,6 +2237,30 @@ fn prompt_secret_from_tui(prompt: &str) -> anyhow::Result<String> {
 
 fn prompt_key_passphrase_from_tui(path: &Path) -> anyhow::Result<String> {
     prompt_secret_from_tui(&format!("Passphrase for {}: ", path.display()))
+}
+
+fn edit_config_from_tui(config: &mut AppConfig) -> anyhow::Result<()> {
+    let _restore_tui = scopeguard::guard((), |_| {
+        io::stdout().execute(EnterAlternateScreen).ok();
+        terminal::enable_raw_mode().ok();
+    });
+
+    terminal::disable_raw_mode()?;
+    io::stdout().execute(LeaveAlternateScreen)?;
+
+    let path = AppConfig::data_dir().join("config.toml");
+    if !path.exists() {
+        config.save()?;
+    }
+
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+    let status = Command::new(&editor).arg(&path).status()?;
+    if !status.success() {
+        anyhow::bail!("Editor '{}' exited with status {}", editor, status);
+    }
+
+    *config = AppConfig::load()?;
+    Ok(())
 }
 
 fn resolve_key_auth_method<F>(
@@ -1938,8 +2306,51 @@ fn prompt_password_auth_from_tui(username: &str, hostname: &str) -> anyhow::Resu
     Ok(AuthMethod::Password(password))
 }
 
-fn should_retry_with_password(auth: &AuthMethod, err: &SshError) -> bool {
-    !matches!(auth, AuthMethod::Password(_)) && matches!(err, SshError::Auth(_))
+fn should_try_next_auth_candidate(err: &SshError) -> bool {
+    matches!(err, SshError::Auth(_) | SshError::Key(_))
+}
+
+async fn connect_session_with_auth_candidates(
+    app: &mut App,
+    config: &AppConfig,
+    host: &HostDisplay,
+    hostname: String,
+    port: u16,
+    username: String,
+    auth_candidates: Vec<AuthMethod>,
+) -> Result<(ConnectConfig, SshSession, String, Option<String>), SshError> {
+    let mut last_auth_error = None;
+
+    for auth in auth_candidates {
+        let auth = match resolve_key_auth_method(auth, prompt_key_passphrase_from_tui) {
+            Ok(auth) => auth,
+            Err(err) if should_try_next_auth_candidate(&err) => {
+                last_auth_error = Some(err);
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+
+        let connect_config = ConnectConfig {
+            hostname: hostname.clone(),
+            port,
+            username: username.clone(),
+            auth,
+        };
+
+        match connect_session_for_host(app, config, host, &connect_config).await {
+            Ok((ssh_session, fingerprint, banner)) => {
+                return Ok((connect_config, ssh_session, fingerprint, banner));
+            }
+            Err(err) if should_try_next_auth_candidate(&err) => {
+                last_auth_error = Some(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(last_auth_error
+        .unwrap_or_else(|| SshError::Auth("No authentication methods available".to_string())))
 }
 
 async fn connect_session_for_host(
@@ -2019,34 +2430,11 @@ async fn open_session(
         config.general.default_user.clone().unwrap_or_else(whoami)
     };
 
-    let auth = match configured_auth_method(
+    let auth_candidates = configured_auth_methods(
         host_entry.and_then(|entry| entry.key.as_deref()),
         config.general.default_key.as_deref(),
         ssh_agent_available(),
-    )? {
-        Some(auth) => auth,
-        None => match prompt_password_auth_from_tui(&user, &host.hostname) {
-            Ok(auth) => auth,
-            Err(err) => {
-                app.set_status(format!("Password prompt failed: {}", err));
-                return Ok(());
-            }
-        },
-    };
-    let auth = match resolve_key_auth_method(auth, prompt_key_passphrase_from_tui) {
-        Ok(auth) => auth,
-        Err(err) => {
-            app.set_status(format!("Key auth setup failed: {}", err));
-            return Ok(());
-        }
-    };
-
-    let mut connect_config = ConnectConfig {
-        hostname: host.hostname.clone(),
-        port: host.port,
-        username: user.clone(),
-        auth,
-    };
+    )?;
 
     let label = if host.name.is_empty() {
         host.hostname.clone()
@@ -2073,22 +2461,36 @@ async fn open_session(
     };
     app.add_session_tracking(config.host_monitor.history_samples);
 
-    audit.log_connection_attempt(
-        &session_id,
-        &connect_config.hostname,
-        connect_config.port,
-        &connect_config.username,
-    );
+    audit.log_connection_attempt(&session_id, &host.hostname, host.port, &user);
 
     app.view = AppView::Session;
 
-    let mut connect_result = connect_session_for_host(app, config, host, &connect_config).await;
-    if matches!(connect_result, Err(ref err) if should_retry_with_password(&connect_config.auth, err))
-    {
-        match prompt_password_auth_from_tui(&connect_config.username, &connect_config.hostname) {
+    let mut connect_result = connect_session_with_auth_candidates(
+        app,
+        config,
+        host,
+        host.hostname.clone(),
+        host.port,
+        user.clone(),
+        auth_candidates,
+    )
+    .await;
+
+    if matches!(connect_result, Err(ref err) if should_try_next_auth_candidate(err)) {
+        match prompt_password_auth_from_tui(&user, &host.hostname) {
             Ok(auth) => {
-                connect_config.auth = auth;
-                connect_result = connect_session_for_host(app, config, host, &connect_config).await;
+                let password_connect_config = ConnectConfig {
+                    hostname: host.hostname.clone(),
+                    port: host.port,
+                    username: user.clone(),
+                    auth,
+                };
+                connect_result =
+                    connect_session_for_host(app, config, host, &password_connect_config)
+                        .await
+                        .map(|(ssh_session, fingerprint, banner)| {
+                            (password_connect_config, ssh_session, fingerprint, banner)
+                        });
             }
             Err(err) => {
                 let reason = format!("Password prompt failed: {}", err);
@@ -2105,7 +2507,7 @@ async fn open_session(
 
     // Connect (directly or via jump host)
     match connect_result {
-        Ok((mut ssh_session, fingerprint, banner)) => {
+        Ok((connect_config, mut ssh_session, fingerprint, banner)) => {
             // TOFU check
             let db = CacheDb::open_default()?;
             let status =
@@ -2750,6 +3152,163 @@ fn prompt_password(prompt: &str) -> anyhow::Result<String> {
     }
 }
 
+fn parse_dashboard_host_input(input: &str) -> Result<config::HostEntry, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("Host cannot be empty".to_string());
+    }
+
+    let (user, host_port) = match trimmed.split_once('@') {
+        Some((user, rest)) if !user.is_empty() && !rest.is_empty() => {
+            (Some(user.to_string()), rest)
+        }
+        Some(_) => return Err("Use user@host[:port] or host[:port]".to_string()),
+        None => (None, trimmed),
+    };
+
+    let (hostname, port) = parse_host_and_port(host_port)?;
+
+    Ok(config::HostEntry {
+        name: hostname.clone(),
+        hostname,
+        port,
+        user,
+        key: None,
+        tags: std::collections::HashMap::new(),
+        jump_host: None,
+        port_forwards: Vec::new(),
+    })
+}
+
+fn parse_host_and_port(input: &str) -> Result<(String, u16), String> {
+    if input.is_empty() {
+        return Err("Host cannot be empty".to_string());
+    }
+
+    if let Some((host, port_str)) = input.rsplit_once(':') {
+        if !host.is_empty() && !port_str.is_empty() {
+            let port = port_str
+                .parse::<u16>()
+                .map_err(|_| format!("Invalid port '{}'. Use host[:port]", port_str))?;
+            return Ok((host.to_string(), port));
+        }
+    }
+
+    Ok((input.to_string(), 22))
+}
+
+struct HostSaveResult {
+    verb: &'static str,
+    hostname: String,
+    port: u16,
+}
+
+fn save_host_dialog_entry(
+    config: &mut AppConfig,
+    original: Option<(&str, u16)>,
+    entry: config::HostEntry,
+) -> HostSaveResult {
+    let hostname = entry.hostname.clone();
+    let port = entry.port;
+
+    let verb = if let Some((original_hostname, original_port)) = original {
+        edit_config_host(config, original_hostname, original_port, entry);
+        "Updated"
+    } else if upsert_config_host(config, entry) {
+        "Added"
+    } else {
+        "Updated"
+    };
+
+    HostSaveResult {
+        verb,
+        hostname,
+        port,
+    }
+}
+
+fn edit_config_host(
+    config: &mut AppConfig,
+    original_hostname: &str,
+    original_port: u16,
+    entry: config::HostEntry,
+) {
+    let original_idx = config
+        .hosts
+        .iter()
+        .position(|host| host.hostname == original_hostname && host.port == original_port);
+
+    if let Some(idx) = original_idx {
+        let target_idx = config.hosts.iter().position(|host| {
+            host.hostname == entry.hostname
+                && host.port == entry.port
+                && !(host.hostname == original_hostname && host.port == original_port)
+        });
+
+        if let Some(target_idx) = target_idx {
+            config.hosts[target_idx].name = entry.name;
+            config.hosts[target_idx].user = entry.user;
+            config.hosts.remove(idx);
+        } else {
+            let existing = &mut config.hosts[idx];
+            existing.name = entry.name;
+            existing.hostname = entry.hostname;
+            existing.port = entry.port;
+            existing.user = entry.user;
+        }
+    } else {
+        let _ = upsert_config_host(config, entry);
+    }
+}
+
+fn upsert_config_host(config: &mut AppConfig, entry: config::HostEntry) -> bool {
+    if let Some(existing) = config
+        .hosts
+        .iter_mut()
+        .find(|host| host.hostname == entry.hostname && host.port == entry.port)
+    {
+        existing.name = entry.name;
+        existing.user = entry.user;
+        false
+    } else {
+        config.hosts.push(entry);
+        true
+    }
+}
+
+fn remove_config_host(config: &mut AppConfig, hostname: &str, port: u16) -> bool {
+    let original_len = config.hosts.len();
+    config
+        .hosts
+        .retain(|host| !(host.hostname == hostname && host.port == port));
+    config.hosts.len() != original_len
+}
+
+fn format_host_dialog_input(host: &HostDisplay) -> String {
+    let mut value = String::new();
+    if !host.user.is_empty() {
+        value.push_str(&host.user);
+        value.push('@');
+    }
+    value.push_str(&host.hostname);
+    if host.port != 22 {
+        value.push(':');
+        value.push_str(&host.port.to_string());
+    }
+    value
+}
+
+fn select_host(app: &mut App, hostname: &str, port: u16) {
+    if let Some(idx) = app
+        .hosts
+        .iter()
+        .position(|host| host.hostname == hostname && host.port == port)
+    {
+        app.selected_host = idx;
+        app.table_state.select(Some(idx));
+    }
+}
+
 fn load_hosts_into_app(app: &mut App, config: &AppConfig) -> anyhow::Result<()> {
     let mut displays = Vec::new();
 
@@ -3283,6 +3842,175 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_dashboard_host_input_with_user_and_port() {
+        let entry = parse_dashboard_host_input("deploy@web.example.com:2222").expect("parse");
+        assert_eq!(entry.hostname, "web.example.com");
+        assert_eq!(entry.port, 2222);
+        assert_eq!(entry.user.as_deref(), Some("deploy"));
+        assert_eq!(entry.name, "web.example.com");
+    }
+
+    #[test]
+    fn test_parse_dashboard_host_input_defaults_port() {
+        let entry = parse_dashboard_host_input("db.internal").expect("parse");
+        assert_eq!(entry.hostname, "db.internal");
+        assert_eq!(entry.port, 22);
+        assert_eq!(entry.user, None);
+    }
+
+    #[test]
+    fn test_alt_session_switch_index_supports_mac_option_number_symbols() {
+        assert_eq!(alt_session_switch_index(&KeyCode::Char('1')), Some(0));
+        assert_eq!(alt_session_switch_index(&KeyCode::Char('¡')), Some(0));
+        assert_eq!(alt_session_switch_index(&KeyCode::Char('5')), Some(4));
+        assert_eq!(alt_session_switch_index(&KeyCode::Char('∞')), Some(4));
+        assert_eq!(alt_session_switch_index(&KeyCode::Char('9')), Some(8));
+        assert_eq!(alt_session_switch_index(&KeyCode::Char('ª')), Some(8));
+        assert_eq!(alt_session_switch_index(&KeyCode::Char('0')), None);
+    }
+
+    #[test]
+    fn test_plain_option_symbol_session_switch_index_only_matches_mac_symbols() {
+        assert_eq!(
+            plain_option_symbol_session_switch_index(&KeyCode::Char('¡')),
+            Some(0)
+        );
+        assert_eq!(
+            plain_option_symbol_session_switch_index(&KeyCode::Char('•')),
+            Some(7)
+        );
+        assert_eq!(
+            plain_option_symbol_session_switch_index(&KeyCode::Char('1')),
+            None
+        );
+    }
+
+    #[test]
+    fn test_has_meta_modifier_recognizes_alt_and_meta() {
+        assert!(has_meta_modifier(KeyModifiers::ALT));
+        assert!(has_meta_modifier(KeyModifiers::META));
+        assert!(!has_meta_modifier(KeyModifiers::SHIFT));
+    }
+
+    #[test]
+    fn test_upsert_config_host_updates_existing_entry() {
+        let mut config = AppConfig::default();
+        config.hosts.push(config::HostEntry {
+            name: "old-name".to_string(),
+            hostname: "web.example.com".to_string(),
+            port: 22,
+            user: Some("old-user".to_string()),
+            key: Some("~/.ssh/id_ed25519".to_string()),
+            tags: std::collections::HashMap::new(),
+            jump_host: Some("bastion".to_string()),
+            port_forwards: Vec::new(),
+        });
+
+        let added = upsert_config_host(
+            &mut config,
+            config::HostEntry {
+                name: "web.example.com".to_string(),
+                hostname: "web.example.com".to_string(),
+                port: 22,
+                user: Some("deploy".to_string()),
+                key: None,
+                tags: std::collections::HashMap::new(),
+                jump_host: None,
+                port_forwards: Vec::new(),
+            },
+        );
+
+        assert!(!added);
+        assert_eq!(config.hosts.len(), 1);
+        assert_eq!(config.hosts[0].user.as_deref(), Some("deploy"));
+        assert_eq!(config.hosts[0].key.as_deref(), Some("~/.ssh/id_ed25519"));
+        assert_eq!(config.hosts[0].jump_host.as_deref(), Some("bastion"));
+    }
+
+    #[test]
+    fn test_edit_config_host_preserves_metadata_when_endpoint_changes() {
+        let mut tags = std::collections::HashMap::new();
+        tags.insert("env".to_string(), "prod".to_string());
+
+        let mut config = AppConfig::default();
+        config.hosts.push(config::HostEntry {
+            name: "web-old".to_string(),
+            hostname: "web-old.example.com".to_string(),
+            port: 22,
+            user: Some("ops".to_string()),
+            key: Some("~/.ssh/id_ed25519".to_string()),
+            tags,
+            jump_host: Some("bastion".to_string()),
+            port_forwards: vec![config::PortForwardConfig {
+                direction: "local".to_string(),
+                bind_host: "127.0.0.1".to_string(),
+                bind_port: 15432,
+                target_host: "db.internal".to_string(),
+                target_port: 5432,
+            }],
+        });
+
+        edit_config_host(
+            &mut config,
+            "web-old.example.com",
+            22,
+            config::HostEntry {
+                name: "web-new".to_string(),
+                hostname: "web-new.example.com".to_string(),
+                port: 2222,
+                user: Some("deploy".to_string()),
+                key: None,
+                tags: std::collections::HashMap::new(),
+                jump_host: None,
+                port_forwards: Vec::new(),
+            },
+        );
+
+        assert_eq!(config.hosts.len(), 1);
+        let host = &config.hosts[0];
+        assert_eq!(host.name, "web-new");
+        assert_eq!(host.hostname, "web-new.example.com");
+        assert_eq!(host.port, 2222);
+        assert_eq!(host.user.as_deref(), Some("deploy"));
+        assert_eq!(host.key.as_deref(), Some("~/.ssh/id_ed25519"));
+        assert_eq!(host.tags.get("env").map(String::as_str), Some("prod"));
+        assert_eq!(host.jump_host.as_deref(), Some("bastion"));
+        assert_eq!(host.port_forwards.len(), 1);
+        assert_eq!(host.port_forwards[0].target_host, "db.internal");
+        assert_eq!(host.port_forwards[0].target_port, 5432);
+    }
+
+    #[test]
+    fn test_remove_config_host_deletes_matching_entry_only() {
+        let mut config = AppConfig::default();
+        config.hosts.push(config::HostEntry {
+            name: "web".to_string(),
+            hostname: "web.example.com".to_string(),
+            port: 22,
+            user: Some("deploy".to_string()),
+            key: None,
+            tags: std::collections::HashMap::new(),
+            jump_host: None,
+            port_forwards: Vec::new(),
+        });
+        config.hosts.push(config::HostEntry {
+            name: "db".to_string(),
+            hostname: "db.example.com".to_string(),
+            port: 5432,
+            user: Some("postgres".to_string()),
+            key: None,
+            tags: std::collections::HashMap::new(),
+            jump_host: None,
+            port_forwards: Vec::new(),
+        });
+
+        assert!(remove_config_host(&mut config, "web.example.com", 22));
+        assert_eq!(config.hosts.len(), 1);
+        assert_eq!(config.hosts[0].hostname, "db.example.com");
+        assert!(!remove_config_host(&mut config, "web.example.com", 22));
+    }
+
+    #[test]
     fn test_jump_host_resolution_from_config() {
         let mut config = AppConfig::default();
         config.hosts.push(config::HostEntry {
@@ -3343,34 +4071,60 @@ mod tests {
     }
 
     #[test]
-    fn test_configured_auth_method_prefers_host_key_default_key_then_agent() {
-        let host_key = configured_auth_method(Some("~/host_key"), Some("~/default_key"), true)
-            .expect("host key auth")
-            .expect("host key auth method");
-        assert!(matches!(host_key, AuthMethod::KeyFile { .. }));
+    fn test_auth_candidates_from_paths_prefers_host_key_default_key_cached_keys_then_agent() {
+        let host_key = NamedTempFile::new().expect("host key temp file");
+        let default_key = NamedTempFile::new().expect("default key temp file");
+        let cached_key = NamedTempFile::new().expect("cached key temp file");
+        let standard_key = NamedTempFile::new().expect("standard key temp file");
 
-        let default_key = configured_auth_method(None, Some("~/default_key"), true)
-            .expect("default key auth")
-            .expect("default key auth method");
-        match default_key {
-            AuthMethod::KeyFile { path, passphrase } => {
-                assert!(path.to_string_lossy().contains("default_key"));
-                assert!(passphrase.is_none());
-            }
-            _ => panic!("expected key file auth"),
-        }
+        let methods = auth_candidates_from_paths(
+            Some(host_key.path().to_str().expect("host key path")),
+            Some(default_key.path().to_str().expect("default key path")),
+            &[cached_key.path().to_path_buf()],
+            &[standard_key.path().to_path_buf()],
+            true,
+        );
 
-        let agent = configured_auth_method(None, None, true)
-            .expect("agent auth")
-            .expect("agent auth method");
-        assert!(matches!(agent, AuthMethod::Agent));
+        assert_eq!(methods.len(), 5);
+        assert!(matches!(
+            &methods[0],
+            AuthMethod::KeyFile { path, .. } if path == host_key.path()
+        ));
+        assert!(matches!(
+            &methods[1],
+            AuthMethod::KeyFile { path, .. } if path == default_key.path()
+        ));
+        assert!(matches!(
+            &methods[2],
+            AuthMethod::KeyFile { path, .. } if path == cached_key.path()
+        ));
+        assert!(matches!(
+            &methods[3],
+            AuthMethod::KeyFile { path, .. } if path == standard_key.path()
+        ));
+        assert!(matches!(methods[4], AuthMethod::Agent));
     }
 
     #[test]
-    fn test_configured_auth_method_returns_none_without_key_or_agent() {
-        assert!(configured_auth_method(None, None, false)
-            .expect("missing auth")
-            .is_none());
+    fn test_auth_candidates_from_paths_deduplicates_and_skips_missing_keys() {
+        let shared_key = NamedTempFile::new().expect("shared key temp file");
+
+        let methods = auth_candidates_from_paths(
+            Some(shared_key.path().to_str().expect("shared key path")),
+            Some(shared_key.path().to_str().expect("shared key path")),
+            &[
+                shared_key.path().to_path_buf(),
+                PathBuf::from("/tmp/essh-missing-key"),
+            ],
+            &[shared_key.path().to_path_buf()],
+            false,
+        );
+
+        assert_eq!(methods.len(), 1);
+        assert!(matches!(
+            &methods[0],
+            AuthMethod::KeyFile { path, .. } if path == shared_key.path()
+        ));
     }
 
     #[test]
@@ -3412,18 +4166,15 @@ mod tests {
     }
 
     #[test]
-    fn test_should_retry_with_password_only_for_non_password_auth_failures() {
-        assert!(should_retry_with_password(
-            &AuthMethod::Agent,
-            &SshError::Auth("Authentication failed".to_string())
-        ));
-        assert!(!should_retry_with_password(
-            &AuthMethod::Password("secret".to_string()),
-            &SshError::Auth("Authentication failed".to_string())
-        ));
-        assert!(!should_retry_with_password(
-            &AuthMethod::Agent,
-            &SshError::HostKey("mismatch".to_string())
-        ));
+    fn test_should_try_next_auth_candidate_for_auth_and_key_errors_only() {
+        assert!(should_try_next_auth_candidate(&SshError::Auth(
+            "Authentication failed".to_string()
+        )));
+        assert!(should_try_next_auth_candidate(&SshError::Key(
+            russh::keys::Error::KeyIsEncrypted,
+        )));
+        assert!(!should_try_next_auth_candidate(&SshError::HostKey(
+            "mismatch".to_string()
+        )));
     }
 }

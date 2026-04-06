@@ -70,6 +70,14 @@ impl FleetProber {
         }
     }
 
+    pub fn probe_timeout(&self) -> Duration {
+        self.probe_timeout
+    }
+
+    pub fn mark_probe_started(&mut self) {
+        self.last_probe_cycle = Some(Instant::now());
+    }
+
     /// Probe a single host via TCP connect. Returns the result.
     pub async fn probe_host(hostname: &str, port: u16, timeout: Duration) -> ProbeResult {
         let addr = format!("{}:{}", hostname, port);
@@ -91,33 +99,38 @@ impl FleetProber {
         }
     }
 
-    /// Run a full probe cycle against all registered hosts.
-    pub async fn probe_all(&mut self, hosts: &[(String, u16)]) {
-        let timeout = self.probe_timeout;
-        let capacity = self.history_capacity;
-
-        // Probe all hosts concurrently
-        let mut handles = Vec::new();
+    pub async fn probe_hosts(
+        hosts: Vec<(String, u16)>,
+        timeout: Duration,
+    ) -> Vec<(String, u16, ProbeResult)> {
+        let mut handles = Vec::with_capacity(hosts.len());
         for (hostname, port) in hosts {
-            let hostname = hostname.clone();
-            let port = *port;
             handles.push(tokio::spawn(async move {
                 let result = Self::probe_host(&hostname, port, timeout).await;
-                (format!("{}:{}", hostname, port), result)
+                (hostname, port, result)
             }));
         }
 
+        let mut results = Vec::with_capacity(handles.len());
         for handle in handles {
-            if let Ok((key, result)) = handle.await {
-                let state = self
-                    .states
-                    .entry(key)
-                    .or_insert_with(|| HostProbeState::new(capacity));
-                state.record(result);
+            if let Ok(result) = handle.await {
+                results.push(result);
             }
         }
+        results
+    }
 
-        self.last_probe_cycle = Some(Instant::now());
+    pub fn record_probe_results(&mut self, results: Vec<(String, u16, ProbeResult)>) {
+        let capacity = self.history_capacity;
+
+        for (hostname, port, result) in results {
+            let key = format!("{}:{}", hostname, port);
+            let state = self
+                .states
+                .entry(key)
+                .or_insert_with(|| HostProbeState::new(capacity));
+            state.record(result);
+        }
     }
 
     /// Get probe state for a specific host.
@@ -196,6 +209,26 @@ mod tests {
     fn test_fleet_prober_get_state_missing() {
         let prober = FleetProber::new(60, 5, 30);
         assert!(prober.get_state("nonexistent", 22).is_none());
+    }
+
+    #[test]
+    fn test_fleet_prober_record_probe_results_updates_state() {
+        let mut prober = FleetProber::new(60, 5, 3);
+        prober.record_probe_results(vec![(
+            "web.example.com".to_string(),
+            22,
+            ProbeResult {
+                online: true,
+                latency_ms: Some(12.0),
+                last_probed: Instant::now(),
+            },
+        )]);
+
+        let state = prober
+            .get_state("web.example.com", 22)
+            .expect("probe state");
+        assert!(state.result.online);
+        assert_eq!(state.latency_history, vec![12]);
     }
 
     #[tokio::test]

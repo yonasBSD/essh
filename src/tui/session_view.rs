@@ -2,6 +2,7 @@ use crate::diagnostics::DiagnosticsSnapshot;
 use crate::portfwd::PortForwardManager;
 use crate::session::{Session, SessionState};
 use crate::theme::Theme;
+use crate::tui::meta_key_hint;
 use crate::tui::widgets;
 use crate::tui::Notification;
 use ratatui::{
@@ -255,22 +256,31 @@ pub fn render_status_bar(
 
 /// Render the session footer with keybindings
 pub fn render_footer(f: &mut Frame, area: Rect, theme: &Theme) {
+    let switch_hint = meta_key_hint("←→");
+    let split_hint = meta_key_hint("s");
+    let monitor_hint = meta_key_hint("m");
+    let files_hint = meta_key_hint("f");
+    let detach_hint = meta_key_hint("d");
+    let close_hint = meta_key_hint("w");
+    let theme_hint = meta_key_hint("t");
+    let help_hint = meta_key_hint("h");
+
     let footer = Paragraph::new(Line::from(vec![
-        Span::styled("Alt+←→", Style::default().fg(theme.key_hint)),
+        Span::styled(switch_hint, Style::default().fg(theme.key_hint)),
         Span::raw(":Switch  "),
-        Span::styled("Alt+s", Style::default().fg(theme.key_hint)),
+        Span::styled(split_hint, Style::default().fg(theme.key_hint)),
         Span::raw(":Split  "),
-        Span::styled("Alt+m", Style::default().fg(theme.key_hint)),
+        Span::styled(monitor_hint, Style::default().fg(theme.key_hint)),
         Span::raw(":Monitor  "),
-        Span::styled("Alt+f", Style::default().fg(theme.key_hint)),
+        Span::styled(files_hint, Style::default().fg(theme.key_hint)),
         Span::raw(":Files  "),
-        Span::styled("Alt+d", Style::default().fg(theme.key_hint)),
+        Span::styled(detach_hint, Style::default().fg(theme.key_hint)),
         Span::raw(":Detach  "),
-        Span::styled("Alt+w", Style::default().fg(theme.key_hint)),
+        Span::styled(close_hint, Style::default().fg(theme.key_hint)),
         Span::raw(":Close  "),
-        Span::styled("Alt+t", Style::default().fg(theme.key_hint)),
+        Span::styled(theme_hint, Style::default().fg(theme.key_hint)),
         Span::raw(":Theme  "),
-        Span::styled("Alt+h", Style::default().fg(theme.key_hint)),
+        Span::styled(help_hint, Style::default().fg(theme.key_hint)),
         Span::raw(":Help"),
     ]))
     .block(

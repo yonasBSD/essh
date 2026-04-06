@@ -97,6 +97,10 @@ pub fn render(
                 "L:bind_port:target_host:target_port  ",
                 Style::default().fg(theme.text_muted),
             ),
+            Span::styled("Enter", Style::default().fg(theme.key_hint)),
+            Span::raw(":Save  "),
+            Span::styled("Esc", Style::default().fg(theme.key_hint)),
+            Span::raw(":Cancel  "),
             Span::styled("> ", Style::default().fg(theme.brand)),
             Span::raw(input),
             Span::styled("█", Style::default().fg(theme.brand)),
@@ -104,6 +108,8 @@ pub fn render(
         f.render_widget(input_line, chunks[1]);
     } else {
         let footer = Paragraph::new(Line::from(vec![
+            Span::styled("↑↓", Style::default().fg(theme.key_hint)),
+            Span::raw(":Select  "),
             Span::styled("a", Style::default().fg(theme.key_hint)),
             Span::raw(":Add  "),
             Span::styled("d", Style::default().fg(theme.key_hint)),

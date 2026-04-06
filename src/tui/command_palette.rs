@@ -4,6 +4,7 @@ use ratatui::{
 };
 
 use crate::theme::Theme;
+use crate::tui::meta_key_hint;
 
 use super::{AppView, DashboardTab, HostDisplay, HostStatus};
 use crate::session::Session;
@@ -56,6 +57,10 @@ impl CommandPalette {
 
     /// Rebuild the entry list based on current query, hosts, and sessions.
     pub fn update(&mut self, hosts: &[HostDisplay], sessions: &[Session], has_sessions: bool) {
+        let split_hint = meta_key_hint("s");
+        let monitor_hint = meta_key_hint("m");
+        let portfwd_hint = meta_key_hint("p");
+        let files_hint = meta_key_hint("f");
         let mut entries = Vec::new();
 
         // Hosts — "connect <name>"
@@ -132,28 +137,28 @@ impl CommandPalette {
             entries.push(PaletteEntry {
                 icon: "🔲",
                 label: "Toggle: Split Pane".to_string(),
-                detail: "Terminal + monitor side-by-side (Alt+s)".to_string(),
+                detail: format!("Terminal + monitor side-by-side ({})", split_hint),
                 action: PaletteAction::ToggleSplitPane,
                 score: 0,
             });
             entries.push(PaletteEntry {
                 icon: "📊",
                 label: "View: Host Monitor".to_string(),
-                detail: "Full-screen host metrics (Alt+m)".to_string(),
+                detail: format!("Full-screen host metrics ({})", monitor_hint),
                 action: PaletteAction::SetView(AppView::Monitor),
                 score: 0,
             });
             entries.push(PaletteEntry {
                 icon: "🔀",
                 label: "View: Port Forwarding".to_string(),
-                detail: "Manage port forwards (Alt+p)".to_string(),
+                detail: format!("Manage port forwards ({})", portfwd_hint),
                 action: PaletteAction::SetView(AppView::PortForwarding),
                 score: 0,
             });
             entries.push(PaletteEntry {
                 icon: "📁",
                 label: "View: File Browser".to_string(),
-                detail: "Upload/download files (Alt+f)".to_string(),
+                detail: format!("Upload/download files ({})", files_hint),
                 action: PaletteAction::SetView(AppView::FileBrowser),
                 score: 0,
             });

@@ -215,6 +215,12 @@ fn render_transfer_bar(f: &mut Frame, area: Rect, browser: &FileBrowser, theme: 
 
 fn render_footer(f: &mut Frame, area: Rect, theme: &Theme) {
     let footer = Paragraph::new(Line::from(vec![
+        Span::styled(" ↑↓", Style::default().fg(theme.key_hint)),
+        Span::raw(":Select  "),
+        Span::styled("Enter", Style::default().fg(theme.key_hint)),
+        Span::raw(":Open  "),
+        Span::styled("Bksp", Style::default().fg(theme.key_hint)),
+        Span::raw(":Up  "),
         Span::styled(" Tab", Style::default().fg(theme.key_hint)),
         Span::raw(":Switch  "),
         Span::styled("u", Style::default().fg(theme.key_hint)),

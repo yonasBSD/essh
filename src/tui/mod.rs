@@ -20,6 +20,22 @@ use crate::portfwd::PortForwardManager;
 use crate::session::manager::SessionManager;
 use crate::theme::Theme;
 
+pub fn meta_key_label() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "Option"
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        "Alt"
+    }
+}
+
+pub fn meta_key_hint(keys: &str) -> String {
+    format!("{}+{}", meta_key_label(), keys)
+}
+
 pub struct Notification {
     pub session_label: String,
     #[allow(dead_code)]
@@ -81,6 +97,11 @@ pub struct App {
     // Host search/filter
     pub search_active: bool,
     pub search_query: String,
+    // Add-host dialog
+    pub add_host_active: bool,
+    pub add_host_input: String,
+    pub add_host_error: Option<String>,
+    pub add_host_original: Option<(String, u16)>,
     // Split-pane view: terminal + monitor side-by-side
     pub split_pane: bool,
     pub split_pane_pct: u16, // terminal width percentage (20-80)
@@ -120,6 +141,10 @@ impl App {
             show_help: false,
             search_active: false,
             search_query: String::new(),
+            add_host_active: false,
+            add_host_input: String::new(),
+            add_host_error: None,
+            add_host_original: None,
             split_pane: false,
             split_pane_pct: 60,
             session_diagnostics: Vec::new(),
@@ -513,6 +538,16 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         }
     }
 
+    if app.view == AppView::Dashboard && app.add_host_active {
+        dashboard::render_add_host_dialog(
+            frame,
+            app.add_host_original.is_some(),
+            &app.add_host_input,
+            app.add_host_error.as_deref(),
+            &app.theme,
+        );
+    }
+
     // Help overlay (rendered on top of any view)
     if app.show_help {
         help::render(frame, &app.theme);
@@ -669,5 +704,10 @@ mod tests {
         // Can't go above 80
         app.split_pane_pct = (app.split_pane_pct + 5).min(80);
         assert_eq!(app.split_pane_pct, 80);
+    }
+
+    #[test]
+    fn test_meta_key_hint_formats_combo() {
+        assert_eq!(meta_key_hint("1-9"), format!("{}+1-9", meta_key_label()));
     }
 }

@@ -1,9 +1,10 @@
 use crate::session::{Session, SessionState};
 use crate::theme::Theme;
+use crate::tui::meta_key_hint;
 use crate::tui::widgets;
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState},
 };
 
 /// Render the dashboard view (no active session focused)
@@ -477,7 +478,11 @@ fn render_config_tab(f: &mut Frame, area: Rect, theme: &Theme) {
         ),
         Line::raw(""),
         Line::styled(
-            "  Press 't' to cycle themes, or set theme in ~/.essh/config.toml.",
+            "  Press 'e' to edit config, or 't' to cycle themes.",
+            Style::default().fg(theme.text_muted),
+        ),
+        Line::styled(
+            "  Changes reload from ~/.essh/config.toml without restarting.",
             Style::default().fg(theme.text_muted),
         ),
     ])
@@ -492,13 +497,14 @@ fn render_config_tab(f: &mut Frame, area: Rect, theme: &Theme) {
 fn render_footer(
     f: &mut Frame,
     area: Rect,
-    _tab: super::DashboardTab,
+    tab: super::DashboardTab,
     status: Option<&str>,
     search_active: bool,
     search_query: &str,
     theme: &Theme,
 ) {
     let mut lines = Vec::new();
+    let session_switch_hint = meta_key_hint("1-9");
 
     if search_active {
         lines.push(Line::from(vec![
@@ -512,10 +518,10 @@ fn render_footer(
         ]));
     }
 
-    lines.push(Line::from(vec![
+    let mut footer_spans = vec![
         Span::styled("Enter", Style::default().fg(theme.key_hint)),
         Span::raw(":Connect  "),
-        Span::styled("Alt+1-9", Style::default().fg(theme.key_hint)),
+        Span::styled(session_switch_hint, Style::default().fg(theme.key_hint)),
         Span::raw(":Session  "),
         Span::styled("a", Style::default().fg(theme.key_hint)),
         Span::raw(":Add  "),
@@ -523,6 +529,23 @@ fn render_footer(
         Span::raw(":Search  "),
         Span::styled("r", Style::default().fg(theme.key_hint)),
         Span::raw(":Refresh  "),
+    ];
+
+    if tab == super::DashboardTab::Hosts {
+        footer_spans.extend([
+            Span::styled("e", Style::default().fg(theme.key_hint)),
+            Span::raw(":Edit host  "),
+        ]);
+    }
+
+    if tab == super::DashboardTab::Config {
+        footer_spans.extend([
+            Span::styled("e", Style::default().fg(theme.key_hint)),
+            Span::raw(":Edit cfg  "),
+        ]);
+    }
+
+    footer_spans.extend([
         Span::styled("d", Style::default().fg(theme.key_hint)),
         Span::raw(":Delete  "),
         Span::styled("t", Style::default().fg(theme.key_hint)),
@@ -531,7 +554,9 @@ fn render_footer(
         Span::raw(":Palette  "),
         Span::styled("q", Style::default().fg(theme.key_hint)),
         Span::raw(":Quit"),
-    ]));
+    ]);
+
+    lines.push(Line::from(footer_spans));
 
     if let Some(msg) = status {
         lines.push(Line::from(Span::styled(
@@ -543,4 +568,95 @@ fn render_footer(
     let footer = Paragraph::new(lines)
         .block(Block::bordered().border_style(Style::default().fg(theme.border)));
     f.render_widget(footer, area);
+}
+
+pub fn render_add_host_dialog(
+    f: &mut Frame,
+    editing: bool,
+    input: &str,
+    error: Option<&str>,
+    theme: &Theme,
+) {
+    let area = f.area();
+    let popup_width = 66u16.min(area.width.saturating_sub(4));
+    let popup_height = 8u16.min(area.height.saturating_sub(2));
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup = Rect::new(x, y, popup_width, popup_height);
+
+    f.render_widget(Clear, popup);
+
+    let surface_style = Style::default()
+        .fg(theme.text_primary)
+        .bg(theme.selection_bg);
+    let title = if editing { " Edit Host " } else { " Add Host " };
+    let hint = if editing {
+        "  Update user@host[:port] or host[:port] for the selected host."
+    } else {
+        "  Enter user@host[:port] or host[:port]."
+    };
+
+    let block = Block::default()
+        .title(title)
+        .title_style(
+            Style::default()
+                .fg(theme.brand)
+                .bg(theme.selection_bg)
+                .bold(),
+        )
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.brand).bg(theme.selection_bg))
+        .style(surface_style);
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let mut lines = vec![
+        Line::styled(
+            hint,
+            Style::default()
+                .fg(theme.text_secondary)
+                .bg(theme.selection_bg),
+        ),
+        Line::styled("", surface_style),
+        Line::from(vec![
+            Span::styled(
+                "  > ",
+                Style::default()
+                    .fg(theme.brand)
+                    .bg(theme.selection_bg)
+                    .bold(),
+            ),
+            Span::styled(
+                input,
+                Style::default()
+                    .fg(theme.text_primary)
+                    .bg(theme.selection_bg),
+            ),
+            Span::styled("█", Style::default().fg(theme.brand).bg(theme.selection_bg)),
+        ]),
+        Line::styled("", surface_style),
+    ];
+
+    if let Some(error) = error {
+        lines.push(Line::styled(
+            format!("  {}", error),
+            Style::default()
+                .fg(theme.status_error)
+                .bg(theme.selection_bg),
+        ));
+    } else {
+        lines.push(Line::styled(
+            "  Enter: save  Esc: cancel",
+            Style::default()
+                .fg(theme.text_secondary)
+                .bg(theme.selection_bg),
+        ));
+    }
+
+    let paragraph = Paragraph::new(lines).style(surface_style).block(
+        Block::default()
+            .style(surface_style)
+            .border_style(Style::default().fg(theme.border).bg(theme.selection_bg)),
+    );
+    f.render_widget(paragraph, inner);
 }
