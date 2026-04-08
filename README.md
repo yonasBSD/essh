@@ -66,6 +66,8 @@ ESSH is for people who manage real systems and want their SSH client to act like
 
 ## Install Fast
 
+ESSH currently supports macOS and Linux builds only.
+
 ### crates.io
 
 ```bash
@@ -80,6 +82,8 @@ cd essh
 cargo build --release
 ./target/release/essh
 ```
+
+Windows is not a supported local build target at this time.
 
 ---
 

@@ -4,6 +4,8 @@
 
 A terminal-based SSH client built for operations teams managing server fleets. ESSH combines enterprise connection management with real-time remote host diagnostics (CPU, memory, disk, network — like a built-in `htop`), concurrent multi-session support with seamless switching, and a Netwatch-inspired TUI aesthetic featuring performance histograms, sparklines, and color-coded health indicators.
 
+The local ESSH application currently supports macOS and Linux builds only.
+
 ---
 
 ## 2. Goals
@@ -690,4 +692,4 @@ Wire up the existing `AuthMethod::Agent` variant to discover keys from the local
 2. ~~Should the virtual terminal emulator support full alternate screen (`vim`, `htop` on remote)?~~ **Resolved:** Yes — `vt100::Parser` provides full alternate screen support.
 3. ~~Should we support split-pane views (terminal + monitor side-by-side) in addition to the overlay toggle?~~ **Resolved:** Implemented in §13.5 — `Alt+s` toggles split-pane with adjustable width.
 4. Plugin system architecture — sandboxing vs. ecosystem reach tradeoff? *(deferred to M10)*
-5. Should we support Windows or Linux/macOS only?
+5. ~~Should we support Windows or Linux/macOS only?~~ **Resolved:** ESSH currently supports local builds on macOS and Linux only.
